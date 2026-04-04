@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 )
@@ -132,4 +133,16 @@ func (d *Datagram) Address() string {
 	}
 	p := strconv.Itoa(int(binary.BigEndian.Uint16(d.DstPort)))
 	return net.JoinHostPort(s, p)
+}
+
+// writeHostUnreachableReply 发送主机不可达的错误回复（提取公共逻辑）
+func writeHostUnreachableReply(w io.Writer, atyp byte) error {
+	var p *Reply
+	if atyp == ATYPIPv4 || atyp == ATYPDomain {
+		p = NewReply(RepHostUnreachable, ATYPIPv4, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0x00, 0x00})
+	} else {
+		p = NewReply(RepHostUnreachable, ATYPIPv6, []byte(net.IPv6zero), []byte{0x00, 0x00})
+	}
+	_, err := p.WriteTo(w)
+	return err
 }

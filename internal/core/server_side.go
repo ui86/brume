@@ -175,7 +175,11 @@ func NewReply(rep byte, atyp byte, bndaddr []byte, bndport []byte) *Reply {
 }
 
 func (r *Reply) WriteTo(w io.Writer) (int64, error) {
-	i, err := w.Write(append(append([]byte{r.Ver, r.Rep, r.Rsv, r.Atyp}, r.BndAddr...), r.BndPort...))
+	buf := make([]byte, 0, 4+len(r.BndAddr)+len(r.BndPort))
+	buf = append(buf, r.Ver, r.Rep, r.Rsv, r.Atyp)
+	buf = append(buf, r.BndAddr...)
+	buf = append(buf, r.BndPort...)
+	i, err := w.Write(buf)
 	if err != nil {
 		return 0, err
 	}

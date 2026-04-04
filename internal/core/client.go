@@ -18,6 +18,11 @@ type Client struct {
 	TCPTimeout    int
 	UDPTimeout    int
 	Dst           string
+
+	// 缓存目标地址解析结果，避免每次 Write 都重复解析
+	dstAtyp byte
+	dstAddr []byte
+	dstPort []byte
 }
 
 // This is just create a client, you need to use Dial to create conn
@@ -107,6 +112,19 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 				return nil, err
 			}
 		}
+		// 缓存目标地址解析结果
+		if dst != "" {
+			a, h, p, err := ParseAddress(dst)
+			if err != nil {
+				return nil, err
+			}
+			if a == ATYPDomain {
+				h = h[1:]
+			}
+			c.dstAtyp = a
+			c.dstAddr = h
+			c.dstPort = p
+		}
 		return c, nil
 	}
 	return nil, errors.New("unsupport network")
@@ -132,14 +150,7 @@ func (c *Client) Write(b []byte) (int, error) {
 	if c.UDPConn == nil {
 		return c.TCPConn.Write(b)
 	}
-	a, h, p, err := ParseAddress(c.Dst)
-	if err != nil {
-		return 0, err
-	}
-	if a == ATYPDomain {
-		h = h[1:]
-	}
-	d := NewDatagram(a, h, p, b)
+	d := NewDatagram(c.dstAtyp, c.dstAddr, c.dstPort, b)
 	b1 := d.Bytes()
 	n, err := c.UDPConn.Write(b1)
 	if err != nil {

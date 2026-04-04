@@ -170,6 +170,7 @@ func (s *Server) Negotiate(rw io.ReadWriter) error {
 		if _, err := rp.WriteTo(rw); err != nil {
 			return err
 		}
+		return errors.New("no acceptable authentication method")
 	}
 	rp := NewNegotiationReply(s.Method)
 	if _, err := rp.WriteTo(rw); err != nil {
@@ -201,11 +202,7 @@ func (s *Server) GetRequest(rw io.ReadWriter) (*Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	var supported bool
-	if slices.Contains(s.SupportedCommands, r.Cmd) {
-		supported = true
-	}
-	if !supported {
+	if !slices.Contains(s.SupportedCommands, r.Cmd) {
 		var p *Reply
 		if r.Atyp == ATYPIPv4 || r.Atyp == ATYPDomain {
 			p = NewReply(RepCommandNotSupported, ATYPIPv4, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0x00, 0x00})
@@ -372,7 +369,8 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 }
 
 func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
-	if r.Cmd == CmdConnect {
+	switch r.Cmd {
+	case CmdConnect:
 		rc, err := r.Connect(c)
 		if err != nil {
 			return err
@@ -390,8 +388,7 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
 		go directTransfer(c, rc, s.TCPTimeout)
 		directTransfer(rc, c, s.TCPTimeout)
 		return nil
-	}
-	if r.Cmd == CmdUDP {
+	case CmdUDP:
 		caddr, err := r.UDP(c, s.ServerAddr)
 		if err != nil {
 			return err
@@ -402,8 +399,9 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
 		defer s.AssociatedUDP.Delete(caddr.String())
 		io.Copy(io.Discard, c) // Keep TCP connection alive
 		return nil
+	default:
+		return ErrUnsupportCmd
 	}
-	return ErrUnsupportCmd
 }
 
 func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) error {
@@ -418,13 +416,15 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 	}
 
 	send := func(ue *UDPExchange, data []byte) error {
-		select {
-		case <-ch:
-			return fmt.Errorf("Association closed")
-		default:
-			_, err := ue.RemoteConn.Write(data)
-			return err
+		if ch != nil {
+			select {
+			case <-ch:
+				return fmt.Errorf("Association closed")
+			default:
+			}
 		}
+		_, err := ue.RemoteConn.Write(data)
+		return err
 	}
 
 	dst := d.Address()
@@ -469,49 +469,51 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 		defer udpBufPool.Put(b)
 
 		for {
-			select {
-			case <-ch:
+			if ch != nil {
+				select {
+				case <-ch:
+					return
+				default:
+				}
+			}
+			if s.UDPTimeout != 0 {
+				ue.RemoteConn.SetDeadline(time.Now().Add(time.Duration(s.UDPTimeout) * time.Second))
+			}
+			buf := b[:cap(b)]
+			n, err := ue.RemoteConn.Read(buf)
+			if err != nil {
 				return
-			default:
-				if s.UDPTimeout != 0 {
-					ue.RemoteConn.SetDeadline(time.Now().Add(time.Duration(s.UDPTimeout) * time.Second))
-				}
-				buf := b[:cap(b)]
-				n, err := ue.RemoteConn.Read(buf)
-				if err != nil {
-					return
-				}
+			}
 
-				// 优化：从 RemoteAddr 直接获取 IP/Port，避免 ParseAddress
-				var a byte
-				var addr, port []byte
+			// 优化：从 RemoteAddr 直接获取 IP/Port，避免 ParseAddress
+			var a byte
+			var addr, port []byte
 
-				if udpAddr, ok := ue.RemoteConn.RemoteAddr().(*net.UDPAddr); ok {
-					if ip4 := udpAddr.IP.To4(); ip4 != nil {
-						a = ATYPIPv4
-						addr = ip4
-					} else {
-						a = ATYPIPv6
-						addr = udpAddr.IP
-					}
-					port = make([]byte, 2)
-					binary.BigEndian.PutUint16(port, uint16(udpAddr.Port))
+			if udpAddr, ok := ue.RemoteConn.RemoteAddr().(*net.UDPAddr); ok {
+				if ip4 := udpAddr.IP.To4(); ip4 != nil {
+					a = ATYPIPv4
+					addr = ip4
 				} else {
-					var err error
-					a, addr, port, err = ParseAddress(dst)
-					if err != nil {
-						log.Println(err)
-						return
-					}
-					if a == ATYPDomain {
-						addr = addr[1:]
-					}
+					a = ATYPIPv6
+					addr = udpAddr.IP
 				}
-
-				d1 := NewDatagram(a, addr, port, buf[0:n])
-				if _, err := s.UDPConn.WriteToUDP(d1.Bytes(), ue.ClientAddr); err != nil {
+				port = make([]byte, 2)
+				binary.BigEndian.PutUint16(port, uint16(udpAddr.Port))
+			} else {
+				var err error
+				a, addr, port, err = ParseAddress(dst)
+				if err != nil {
+					log.Println(err)
 					return
 				}
+				if a == ATYPDomain {
+					addr = addr[1:]
+				}
+			}
+
+			d1 := NewDatagram(a, addr, port, buf[0:n])
+			if _, err := s.UDPConn.WriteToUDP(d1.Bytes(), ue.ClientAddr); err != nil {
+				return
 			}
 		}
 	}(ue, dst)

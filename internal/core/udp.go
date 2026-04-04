@@ -26,14 +26,8 @@ func (r *Request) UDP(c net.Conn, serverAddr net.Addr) (net.Addr, error) {
 	}
 
 	if err != nil {
-		var p *Reply
-		if r.Atyp == ATYPIPv4 || r.Atyp == ATYPDomain {
-			p = NewReply(RepHostUnreachable, ATYPIPv4, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0x00, 0x00})
-		} else {
-			p = NewReply(RepHostUnreachable, ATYPIPv6, []byte(net.IPv6zero), []byte{0x00, 0x00})
-		}
-		if _, err = p.WriteTo(c); err != nil {
-			return nil, err
+		if wErr := writeHostUnreachableReply(c, r.Atyp); wErr != nil {
+			return nil, wErr
 		}
 		return nil, err
 	}
@@ -42,14 +36,8 @@ func (r *Request) UDP(c net.Conn, serverAddr net.Addr) (net.Addr, error) {
 	}
 	a, addr, port, err := ParseAddress(serverAddr.String())
 	if err != nil {
-		var p *Reply
-		if r.Atyp == ATYPIPv4 || r.Atyp == ATYPDomain {
-			p = NewReply(RepHostUnreachable, ATYPIPv4, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0x00, 0x00})
-		} else {
-			p = NewReply(RepHostUnreachable, ATYPIPv6, []byte(net.IPv6zero), []byte{0x00, 0x00})
-		}
-		if _, err = p.WriteTo(c); err != nil {
-			return nil, err
+		if wErr := writeHostUnreachableReply(c, r.Atyp); wErr != nil {
+			return nil, wErr
 		}
 		return nil, err
 	}

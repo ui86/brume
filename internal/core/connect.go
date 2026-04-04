@@ -13,14 +13,8 @@ func (r *Request) Connect(w io.Writer) (net.Conn, error) {
 	}
 	rc, err := DialTCP("tcp", "", r.Address())
 	if err != nil {
-		var p *Reply
-		if r.Atyp == ATYPIPv4 || r.Atyp == ATYPDomain {
-			p = NewReply(RepHostUnreachable, ATYPIPv4, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0x00, 0x00})
-		} else {
-			p = NewReply(RepHostUnreachable, ATYPIPv6, []byte(net.IPv6zero), []byte{0x00, 0x00})
-		}
-		if _, err := p.WriteTo(w); err != nil {
-			return nil, err
+		if wErr := writeHostUnreachableReply(w, r.Atyp); wErr != nil {
+			return nil, wErr
 		}
 		return nil, err
 	}

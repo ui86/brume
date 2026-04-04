@@ -22,7 +22,10 @@ func NewNegotiationRequest(methods []byte) *NegotiationRequest {
 
 // WriteTo write negotiation request packet into server
 func (r *NegotiationRequest) WriteTo(w io.Writer) (int64, error) {
-	i, err := w.Write(append([]byte{r.Ver, r.NMethods}, r.Methods...))
+	buf := make([]byte, 0, 2+len(r.Methods))
+	buf = append(buf, r.Ver, r.NMethods)
+	buf = append(buf, r.Methods...)
+	i, err := w.Write(buf)
 	if err != nil {
 		return 0, err
 	}
@@ -64,7 +67,12 @@ func NewUserPassNegotiationRequest(username []byte, password []byte) *UserPassNe
 
 // WriteTo write user password negotiation request packet into server
 func (r *UserPassNegotiationRequest) WriteTo(w io.Writer) (int64, error) {
-	i, err := w.Write(append(append(append([]byte{r.Ver, r.Ulen}, r.Uname...), r.Plen), r.Passwd...))
+	buf := make([]byte, 0, 3+len(r.Uname)+len(r.Passwd))
+	buf = append(buf, r.Ver, r.Ulen)
+	buf = append(buf, r.Uname...)
+	buf = append(buf, r.Plen)
+	buf = append(buf, r.Passwd...)
+	i, err := w.Write(buf)
 	if err != nil {
 		return 0, err
 	}
@@ -110,7 +118,11 @@ func NewRequest(cmd byte, atyp byte, dstaddr []byte, dstport []byte) *Request {
 
 // WriteTo write request packet into server
 func (r *Request) WriteTo(w io.Writer) (int64, error) {
-	i, err := w.Write(append(append([]byte{r.Ver, r.Cmd, r.Rsv, r.Atyp}, r.DstAddr...), r.DstPort...))
+	buf := make([]byte, 0, 4+len(r.DstAddr)+len(r.DstPort))
+	buf = append(buf, r.Ver, r.Cmd, r.Rsv, r.Atyp)
+	buf = append(buf, r.DstAddr...)
+	buf = append(buf, r.DstPort...)
+	i, err := w.Write(buf)
 	if err != nil {
 		return 0, err
 	}
