@@ -6,6 +6,7 @@ import (
 	"net"
 )
 
+// UDP 处理 SOCKS5 的 UDP ASSOCIATE 命令，返回客户端应使用的中转地址
 func (r *Request) UDP(c net.Conn, serverAddr net.Addr) (net.Addr, error) {
 	var clientAddr net.Addr
 	var err error

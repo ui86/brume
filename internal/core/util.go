@@ -9,8 +9,8 @@ import (
 	"strconv"
 )
 
-// ParseAddress format address x.x.x.x:xx to raw address.
-// addr contains domain length
+// ParseAddress 将地址 x.x.x.x:xx 格式化为原始地址。
+// addr 包含域名长度
 func ParseAddress(address string) (a byte, addr []byte, port []byte, err error) {
 	var h, p string
 	h, p, err = net.SplitHostPort(address)
@@ -35,8 +35,8 @@ func ParseAddress(address string) (a byte, addr []byte, port []byte, err error) 
 	return
 }
 
-// bytes to address
-// addr contains domain length
+// 字节转换为地址
+// addr 包含域名长度
 func ParseBytesAddress(b []byte) (a byte, addr []byte, port []byte, err error) {
 	if len(b) < 1 {
 		err = errors.New("Invalid address")
@@ -79,8 +79,8 @@ func ParseBytesAddress(b []byte) (a byte, addr []byte, port []byte, err error) {
 	return
 }
 
-// ToAddress format raw address to x.x.x.x:xx
-// addr contains domain length
+// ToAddress 将原始地址格式化为 x.x.x.x:xx
+// addr 包含域名长度
 func ToAddress(a byte, addr []byte, port []byte) string {
 	var h, p string
 	if a == ATYPIPv4 || a == ATYPIPv6 {
@@ -99,7 +99,7 @@ func ToAddress(a byte, addr []byte, port []byte) string {
 	return net.JoinHostPort(h, p)
 }
 
-// Address return request address like ip:xx
+// Address 返回请求地址，如 ip:xx
 func (r *Request) Address() string {
 	var s string
 	if r.Atyp == ATYPDomain {
@@ -111,7 +111,7 @@ func (r *Request) Address() string {
 	return net.JoinHostPort(s, p)
 }
 
-// Address return request address like ip:xx
+// Address 返回请求地址，如 ip:xx
 func (r *Reply) Address() string {
 	var s string
 	if r.Atyp == ATYPDomain {
@@ -123,7 +123,7 @@ func (r *Reply) Address() string {
 	return net.JoinHostPort(s, p)
 }
 
-// Address return datagram address like ip:xx
+// Address 返回数据报地址，如 ip:xx
 func (d *Datagram) Address() string {
 	var s string
 	if d.Atyp == ATYPDomain {

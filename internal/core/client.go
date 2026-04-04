@@ -6,12 +6,12 @@ import (
 	"time"
 )
 
-// Client is socks5 client wrapper
+// Client 是 socks5 客户端包装器
 type Client struct {
 	Server   string
 	UserName string
 	Password string
-	// On cmd UDP, let server control the tcp and udp connection relationship
+	// 对于 UDP 命令，让服务器控制 TCP 和 UDP 连接的关系
 	TCPConn       net.Conn
 	UDPConn       net.Conn
 	RemoteAddress net.Addr
@@ -25,7 +25,7 @@ type Client struct {
 	dstPort []byte
 }
 
-// This is just create a client, you need to use Dial to create conn
+// 这只是创建一个客户端，你需要使用 Dial 来创建连接
 func NewClient(addr, username, password string, tcpTimeout, udpTimeout int) (*Client, error) {
 	c := &Client{
 		Server:     addr,
@@ -37,12 +37,14 @@ func NewClient(addr, username, password string, tcpTimeout, udpTimeout int) (*Cl
 	return c, nil
 }
 
+// Dial 拨号连接到目标地址，自动处理 TCP/UDP 协议协商
 func (c *Client) Dial(network, addr string) (net.Conn, error) {
 	return c.DialWithLocalAddr(network, "", addr, nil)
 }
 
-// If you want to send address that expects to use to send UDP, just assign it to src, otherwise it will send zero address.
-// Recommend specifying the src address in a non-NAT environment, and leave it blank in other cases.
+// 如果你想发送期望用于发送 UDP 的地址，只需将其分配给 src，否则它将发送零地址。
+// 建议在非 NAT 环境中指定 src 地址，在其他情况下保持为空。
+// DialWithLocalAddr 允许指定本地地址进行拨号，适用于多网卡环境
 func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr) (net.Conn, error) {
 	c = &Client{
 		Server:        c.Server,
@@ -130,6 +132,7 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 	return nil, errors.New("unsupport network")
 }
 
+// Read 从连接读取数据，如果是 UDP 则会自动剥离 SOCKS5 数据报头
 func (c *Client) Read(b []byte) (int, error) {
 	if c.UDPConn == nil {
 		return c.TCPConn.Read(b)
@@ -146,6 +149,7 @@ func (c *Client) Read(b []byte) (int, error) {
 	return n, nil
 }
 
+// Write 向连接写入数据，如果是 UDP 则会自动封装 SOCKS5 数据报头
 func (c *Client) Write(b []byte) (int, error) {
 	if c.UDPConn == nil {
 		return c.TCPConn.Write(b)
@@ -162,6 +166,7 @@ func (c *Client) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// Close 关闭 TCP 和可能的 UDP 连接
 func (c *Client) Close() error {
 	if c.UDPConn == nil {
 		if c.TCPConn == nil {
@@ -207,6 +212,7 @@ func (c *Client) SetWriteDeadline(t time.Time) error {
 	return c.UDPConn.SetWriteDeadline(t)
 }
 
+// Negotiate 执行 SOCKS5 握手阶段，包括版本协商和用户名密码认证
 func (c *Client) Negotiate(laddr net.Addr) error {
 	src := ""
 	if laddr != nil {
@@ -253,6 +259,7 @@ func (c *Client) Negotiate(laddr net.Addr) error {
 	return nil
 }
 
+// Request 发送 SOCKS5 请求包（如 CONNECT/UDP）并接收服务器回复
 func (c *Client) Request(r *Request) (*Reply, error) {
 	if _, err := r.WriteTo(c.TCPConn); err != nil {
 		return nil, err

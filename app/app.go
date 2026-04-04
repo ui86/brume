@@ -26,7 +26,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		Port:       1080,
 		UDPTimeout: 60,
-		TCPTimeout: 0, // 0 means no timeout
+		TCPTimeout: 0, // 0 表示无超时
 	}
 }
 

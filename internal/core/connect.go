@@ -7,6 +7,7 @@ import (
 	"net"
 )
 
+// Connect 处理 SOCKS5 的 CONNECT 命令，建立与目标地址的 TCP 连接
 func (r *Request) Connect(w io.Writer) (net.Conn, error) {
 	if Debug {
 		log.Println("Call:", r.Address())

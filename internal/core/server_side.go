@@ -12,6 +12,7 @@ var (
 	ErrBadRequest      = errors.New("Bad Request")
 )
 
+// NewNegotiationRequestFrom 从 io.Reader 中读取并解析 SOCKS5 协商请求
 func NewNegotiationRequestFrom(r io.Reader) (*NegotiationRequest, error) {
 	var bb [2]byte // 优化：栈分配
 	if _, err := io.ReadFull(r, bb[:]); err != nil {
@@ -37,6 +38,7 @@ func NewNegotiationRequestFrom(r io.Reader) (*NegotiationRequest, error) {
 	}, nil
 }
 
+// NewNegotiationReply 创建一个新的协商响应包
 func NewNegotiationReply(method byte) *NegotiationReply {
 	return &NegotiationReply{
 		Ver:    Ver,
@@ -44,6 +46,7 @@ func NewNegotiationReply(method byte) *NegotiationReply {
 	}
 }
 
+// WriteTo 将协商响应包写入 io.Writer
 func (r *NegotiationReply) WriteTo(w io.Writer) (int64, error) {
 	i, err := w.Write([]byte{r.Ver, r.Method})
 	if err != nil {
@@ -55,6 +58,7 @@ func (r *NegotiationReply) WriteTo(w io.Writer) (int64, error) {
 	return int64(i), nil
 }
 
+// NewUserPassNegotiationRequestFrom 从 Reader 解析用户名/密码认证请求
 func NewUserPassNegotiationRequestFrom(r io.Reader) (*UserPassNegotiationRequest, error) {
 	var bb [2]byte // 优化
 	if _, err := io.ReadFull(r, bb[:]); err != nil {
@@ -89,6 +93,7 @@ func NewUserPassNegotiationRequestFrom(r io.Reader) (*UserPassNegotiationRequest
 	}, nil
 }
 
+// NewUserPassNegotiationReply 创建用户名/密码认证结果的响应包
 func NewUserPassNegotiationReply(status byte) *UserPassNegotiationReply {
 	return &UserPassNegotiationReply{
 		Ver:    UserPassVer,
@@ -96,6 +101,7 @@ func NewUserPassNegotiationReply(status byte) *UserPassNegotiationReply {
 	}
 }
 
+// WriteTo 将认证结果响应包写入 io.Writer
 func (r *UserPassNegotiationReply) WriteTo(w io.Writer) (int64, error) {
 	i, err := w.Write([]byte{r.Ver, r.Status})
 	if err != nil {
@@ -107,6 +113,7 @@ func (r *UserPassNegotiationReply) WriteTo(w io.Writer) (int64, error) {
 	return int64(i), nil
 }
 
+// NewRequestFrom 从 Reader 解析 SOCKS5 请求包（包含目标地址和端口）
 func NewRequestFrom(r io.Reader) (*Request, error) {
 	var bb [4]byte // 优化
 	if _, err := io.ReadFull(r, bb[:]); err != nil {
@@ -160,6 +167,7 @@ func NewRequestFrom(r io.Reader) (*Request, error) {
 	}, nil
 }
 
+// NewReply 创建一个新的 SOCKS5 响应包
 func NewReply(rep byte, atyp byte, bndaddr []byte, bndport []byte) *Reply {
 	if atyp == ATYPDomain {
 		bndaddr = append([]byte{byte(len(bndaddr))}, bndaddr...)
@@ -174,6 +182,7 @@ func NewReply(rep byte, atyp byte, bndaddr []byte, bndport []byte) *Reply {
 	}
 }
 
+// WriteTo 将 SOCKS5 响应包写入 io.Writer，采用预分配优化
 func (r *Reply) WriteTo(w io.Writer) (int64, error) {
 	buf := make([]byte, 0, 4+len(r.BndAddr)+len(r.BndPort))
 	buf = append(buf, r.Ver, r.Rep, r.Rsv, r.Atyp)
@@ -189,6 +198,7 @@ func (r *Reply) WriteTo(w io.Writer) (int64, error) {
 	return int64(i), nil
 }
 
+// NewDatagramFromBytes 从字节数组解析 UDP 数据报
 func NewDatagramFromBytes(bb []byte) (*Datagram, error) {
 	n := len(bb)
 	minl := 4
@@ -244,6 +254,7 @@ func NewDatagramFromBytes(bb []byte) (*Datagram, error) {
 	return d, nil
 }
 
+// NewDatagram 创建一个新的 UDP 数据报结构体
 func NewDatagram(atyp byte, dstaddr []byte, dstport []byte, data []byte) *Datagram {
 	if atyp == ATYPDomain {
 		dstaddr = append([]byte{byte(len(dstaddr))}, dstaddr...)

@@ -7,11 +7,11 @@ import (
 )
 
 var (
-	// ErrBadReply is the error when read reply
+	// ErrBadReply 是读取回复时的错误
 	ErrBadReply = errors.New("Bad Reply")
 )
 
-// NewNegotiationRequest return negotiation request packet can be writed into server
+// NewNegotiationRequest 返回可以写入服务器的协商请求包
 func NewNegotiationRequest(methods []byte) *NegotiationRequest {
 	return &NegotiationRequest{
 		Ver:      Ver,
@@ -20,7 +20,7 @@ func NewNegotiationRequest(methods []byte) *NegotiationRequest {
 	}
 }
 
-// WriteTo write negotiation request packet into server
+// WriteTo 将协商请求包写入服务器
 func (r *NegotiationRequest) WriteTo(w io.Writer) (int64, error) {
 	buf := make([]byte, 0, 2+len(r.Methods))
 	buf = append(buf, r.Ver, r.NMethods)
@@ -35,7 +35,7 @@ func (r *NegotiationRequest) WriteTo(w io.Writer) (int64, error) {
 	return int64(i), nil
 }
 
-// NewNegotiationReplyFrom read negotiation reply packet from server
+// NewNegotiationReplyFrom 从服务器读取协商回复包
 func NewNegotiationReplyFrom(r io.Reader) (*NegotiationReply, error) {
 	// 优化 3: 使用栈内存
 	var bb [2]byte
@@ -54,7 +54,7 @@ func NewNegotiationReplyFrom(r io.Reader) (*NegotiationReply, error) {
 	}, nil
 }
 
-// NewUserPassNegotiationRequest return user password negotiation request packet can be writed into server
+// NewUserPassNegotiationRequest 返回可以写入服务器的用户名密码协商请求包函数
 func NewUserPassNegotiationRequest(username []byte, password []byte) *UserPassNegotiationRequest {
 	return &UserPassNegotiationRequest{
 		Ver:    UserPassVer,
@@ -65,7 +65,7 @@ func NewUserPassNegotiationRequest(username []byte, password []byte) *UserPassNe
 	}
 }
 
-// WriteTo write user password negotiation request packet into server
+// WriteTo 将用户名密码协商请求包写入服务器
 func (r *UserPassNegotiationRequest) WriteTo(w io.Writer) (int64, error) {
 	buf := make([]byte, 0, 3+len(r.Uname)+len(r.Passwd))
 	buf = append(buf, r.Ver, r.Ulen)
@@ -82,7 +82,7 @@ func (r *UserPassNegotiationRequest) WriteTo(w io.Writer) (int64, error) {
 	return int64(i), nil
 }
 
-// NewUserPassNegotiationReplyFrom read user password negotiation reply packet from server
+// NewUserPassNegotiationReplyFrom 从服务器读取用户名密码协商回复包
 func NewUserPassNegotiationReplyFrom(r io.Reader) (*UserPassNegotiationReply, error) {
 	// 优化 4: 使用栈内存
 	var bb [2]byte
@@ -101,7 +101,7 @@ func NewUserPassNegotiationReplyFrom(r io.Reader) (*UserPassNegotiationReply, er
 	}, nil
 }
 
-// NewRequest return request packet can be writed into server, dstaddr should not have domain length
+// NewRequest 返回可以写入服务器的请求包，dstaddr 不应包含域名长度
 func NewRequest(cmd byte, atyp byte, dstaddr []byte, dstport []byte) *Request {
 	if atyp == ATYPDomain {
 		dstaddr = append([]byte{byte(len(dstaddr))}, dstaddr...)
@@ -116,7 +116,7 @@ func NewRequest(cmd byte, atyp byte, dstaddr []byte, dstport []byte) *Request {
 	}
 }
 
-// WriteTo write request packet into server
+// WriteTo 将请求包写入服务器
 func (r *Request) WriteTo(w io.Writer) (int64, error) {
 	buf := make([]byte, 0, 4+len(r.DstAddr)+len(r.DstPort))
 	buf = append(buf, r.Ver, r.Cmd, r.Rsv, r.Atyp)
@@ -132,7 +132,7 @@ func (r *Request) WriteTo(w io.Writer) (int64, error) {
 	return int64(i), nil
 }
 
-// NewReplyFrom read reply packet from server
+// NewReplyFrom 从服务器读取回复包
 func NewReplyFrom(r io.Reader) (*Reply, error) {
 	// 优化 5: 使用栈内存
 	var bb [4]byte

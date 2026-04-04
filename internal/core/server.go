@@ -16,27 +16,27 @@ import (
 )
 
 var (
-	// ErrUnsupportCmd is the error when got unsupport command
+	// ErrUnsupportCmd 是收到不支持命令时的错误
 	ErrUnsupportCmd = errors.New("Unsupport Command")
-	// ErrUserPassAuth is the error when got invalid username or password
+	// ErrUserPassAuth 是用户名或密码无效时的错误
 	ErrUserPassAuth = errors.New("Invalid Username or Password for Auth")
 )
 
-// tcpBufPool 32KB buffer for TCP copy
+// tcpBufPool 用于 TCP 复制的 32KB 缓冲区池
 var tcpBufPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, 32*1024)
 	},
 }
 
-// udpBufPool 64KB buffer for UDP packets
+// udpBufPool 用于 UDP 数据包的 64KB 缓冲区池
 var udpBufPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, 65507)
 	},
 }
 
-// Server is socks5 server wrapper
+// Server 是 socks5 服务器包装器
 type Server struct {
 	UserName          string
 	Password          string
@@ -153,6 +153,7 @@ func (s *Server) IsAllowed(ip net.IP) bool {
 	return false
 }
 
+// Negotiate 执行 SOCKS5 协商流程，支持匿名和用户名密码认证
 func (s *Server) Negotiate(rw io.ReadWriter) error {
 	rq, err := NewNegotiationRequestFrom(rw)
 	if err != nil {
@@ -197,6 +198,7 @@ func (s *Server) Negotiate(rw io.ReadWriter) error {
 	return nil
 }
 
+// GetRequest 获取客户端发送的 SOCKS5 请求包，并验证命令是否受支持
 func (s *Server) GetRequest(rw io.ReadWriter) (*Request, error) {
 	r, err := NewRequestFrom(rw)
 	if err != nil {
@@ -217,6 +219,7 @@ func (s *Server) GetRequest(rw io.ReadWriter) (*Request, error) {
 	return r, nil
 }
 
+// ListenAndServe 同时启动 TCP 和 UDP 数据包接收循环
 func (s *Server) ListenAndServe(h Handler) error {
 	if h == nil {
 		s.Handle = &DefaultHandle{}
@@ -291,7 +294,7 @@ func (s *Server) ListenAndServe(h Handler) error {
 		Start: func() error {
 			for {
 				b := udpBufPool.Get().([]byte)
-				b = b[:cap(b)] // Reset length
+				b = b[:cap(b)] // 重置长度
 
 				n, addr, err := s.UDPConn.ReadFromUDP(b)
 				if err != nil {
@@ -341,6 +344,7 @@ func handleUDPTask(s *Server, t *udpTask) {
 	}
 }
 
+// Shutdown 优雅关闭服务器，等待所有活跃连接和 Runner 停止
 func (s *Server) Shutdown() error {
 	return s.RunnerGroup.Done()
 }
@@ -368,6 +372,7 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+// TCPHandle 处理 TCP 协议相关的 CONNECT 和 UDP ASSOCIATE 控制连接
 func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
 	switch r.Cmd {
 	case CmdConnect:
@@ -397,13 +402,14 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
 		defer close(ch)
 		s.AssociatedUDP.Store(caddr.String(), ch)
 		defer s.AssociatedUDP.Delete(caddr.String())
-		io.Copy(io.Discard, c) // Keep TCP connection alive
+		io.Copy(io.Discard, c) // 保持 TCP 连接活跃
 		return nil
 	default:
 		return ErrUnsupportCmd
 	}
 }
 
+// UDPHandle 处理 UDP 数据报转发逻辑
 func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) error {
 	src := addr.String()
 	var ch chan byte
