@@ -1,0 +1,57 @@
+# .github/workflows/release.yaml
+
+on:
+  release:
+    types: [created]
+
+permissions:
+    contents: write
+    packages: write
+
+jobs:
+  releases-matrix:
+    name: Release Go Binary
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # build and publish in parallel: linux/386, linux/amd64, linux/arm64, windows/386, windows/amd64, darwin/amd64, darwin/arm64
+        goos: [linux]
+        goarch: [amd64, arm64]
+    steps:
+    - uses: actions/checkout@v6
+    - uses: ui86/go-release-action@v1
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        goos: ${{ matrix.goos }}
+        goarch: ${{ matrix.goarch }}
+        executable_compression: upx
+        md5sum: false
+        ldflags: "-w -s"
+        project_path: "./"
+        binary_name: "brume"
+        pre_command: |
+            export CGO_ENABLED=0;
+        extra_files: README.md
+
+  clean-old-workflows:
+    runs-on: ubuntu-latest
+    name: Clean Old Workflows and Releases
+    needs: releases-matrix
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Delete Old Workflows
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          retain_days: 2
+          keep_minimum_runs: 0
+
+      - name: Delete Old Releases
+        uses: dev-drprasad/delete-older-releases@master
+        with:
+          keep_latest: 3
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
