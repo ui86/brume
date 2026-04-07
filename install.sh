@@ -998,9 +998,10 @@ get_action() {
         echo "1. 安装Brume服务器"
         echo "2. 卸载Brume服务器"
         echo "3. 修改Brume服务器配置"
-        echo "4. 显示帮助信息"
+        echo "4. 一键更新Brume服务器"
+        echo "5. 显示帮助信息"
 
-        read -p "请输入选项 (1-4): " choice
+        read -p "请输入选项 (1-5): " choice
 
         case $choice in
             1)
@@ -1016,6 +1017,10 @@ get_action() {
                 break
                 ;;
             4)
+                action="upgrade"
+                break
+                ;;
+            5)
                 show_help
                 ;;
             *)
@@ -1308,6 +1313,93 @@ get_modify_config() {
 }
 
 # ============================================================
+# 更新函数
+# ============================================================
+
+# 自动获取当前所有参数（非交互式）
+get_current_config_auto() {
+    local init_system=$1
+    local service_file
+
+    case "${init_system}" in
+        systemd) service_file="/etc/systemd/system/${SERVICE_NAME}.service" ;;
+        openrc|sysvinit) service_file="/etc/init.d/${SERVICE_NAME}" ;;
+    esac
+
+    if [ ! -f "${service_file}" ]; then
+        echo -e "${RED}Brume 服务未安装，无法更新${RESET}"
+        exit 1
+    fi
+
+    local cmd_args=""
+    case "${init_system}" in
+        systemd)
+            local exec_start
+            exec_start=$(execute_privileged grep '^ExecStart=' "${service_file}" 2>/dev/null | head -n1)
+            cmd_args=$(echo "$exec_start" | sed "s|^ExecStart=${INSTALL_DIR}/brume ||")
+            ;;
+        openrc)
+            cmd_args=$(execute_privileged grep '^command_args=' "${service_file}" 2>/dev/null | head -n1 | sed 's/^command_args="//' | sed 's/"$//')
+            ;;
+        sysvinit)
+            cmd_args=$(execute_privileged grep '^DAEMON_ARGS=' "${service_file}" 2>/dev/null | head -n1 | sed 's/^DAEMON_ARGS="//' | sed 's/"$//')
+            ;;
+    esac
+
+    # 初始化配置
+    port="${DEFAULT_PORT}"
+    user=""
+    password=""
+    whitelist=""
+
+    # 简单解析已有的 cmd_args
+    set -- $cmd_args
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -p) port="$2"; shift 2 ;;
+            -user) user="$2"; shift 2 ;;
+            -pwd) password="$2"; shift 2 ;;
+            --whitelist) whitelist="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+}
+
+upgrade() {
+    local init_system=$1
+    echo -e "${BLUE}=== Brume 服务器一键更新 ===${RESET}"
+
+    # 1. 自动提取参数
+    get_current_config_auto "${init_system}"
+    echo -e "已提取当前配置: 端口 ${port}, 用户 ${user:-无}, 白名单 ${whitelist:-无限制}"
+
+    # 2. 检测系统架构
+    arch=$(check_architecture)
+    
+    # 3. 获取最新版本
+    version=$(get_latest_version)
+    echo -e "准备更新至版本: ${version}"
+
+    # 4. 停服并清理旧规则（为了重新安全挂载）
+    stop_service_by_init "${init_system}"
+    if [ -n "${whitelist}" ]; then
+        remove_firewall "${port}"
+    fi
+
+    # 5. 下载最新二进制覆盖
+    download_and_install "${version}" "${arch}"
+
+    # 6. 重建服务与防火墙项（确保配置更新）
+    create_service "${init_system}" "${port}" "${user}" "${password}" "${whitelist}"
+    setup_firewall "${port}" "${whitelist}"
+
+    # 7. 重启服务
+    restart_service_by_init "${init_system}"
+
+    echo -e "${GREEN}Brume 服务器一键更新完成！${RESET}"
+}
+
+# ============================================================
 # 主函数
 # ============================================================
 
@@ -1400,6 +1492,10 @@ main() {
 
             # 执行修改操作（包含防火墙规则更新）
             modify "${init_system}"
+            ;;
+        upgrade)
+            # 执行一键更新
+            upgrade "${init_system}"
             ;;
         *)
             echo -e "${RED}未知操作: ${action}${RESET}"
