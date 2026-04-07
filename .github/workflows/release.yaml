@@ -1,4 +1,4 @@
-# .github/workflows/release.yaml
+# Release Go Binary
 
 on:
   release:
