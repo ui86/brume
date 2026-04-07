@@ -77,7 +77,7 @@ func (r *UserPassNegotiationRequest) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 	if Debug {
-		log.Printf("Sent UserNameNegotiationRequest: %#v %#v %#v %#v %#v\n", r.Ver, r.Ulen, r.Uname, r.Plen, r.Passwd)
+		log.Printf("Sent UserNameNegotiationRequest: %#v %#v %#v %#v [REDACTED]\n", r.Ver, r.Ulen, r.Uname, r.Plen)
 	}
 	return int64(i), nil
 }

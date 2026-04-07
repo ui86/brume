@@ -31,9 +31,12 @@ func ParseAddress(address string) (a byte, addr []byte, port []byte, err error) 
 		addr = []byte{byte(len(h))}
 		addr = append(addr, []byte(h)...)
 	}
-	i, _ := strconv.Atoi(p)
+	pi, err := strconv.ParseUint(p, 10, 16)
+	if err != nil {
+		return
+	}
 	port = make([]byte, 2)
-	binary.BigEndian.PutUint16(port, uint16(i))
+	binary.BigEndian.PutUint16(port, uint16(pi))
 	return
 }
 
