@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"iter"
 	"net"
 	"strconv"
+	"time"
 )
 
 // ParseAddress 将地址 x.x.x.x:xx 格式化为原始地址。
@@ -145,4 +147,22 @@ func writeHostUnreachableReply(w io.Writer, atyp byte) error {
 	}
 	_, err := p.WriteTo(w)
 	return err
+}
+
+// RotateQueue1 随机打乱切片
+func RotateQueue1(start, i, size int) int {
+	return (start + i) % size
+}
+
+// RangeRnd 随机打乱切片
+func RangeRnd[S ~[]E, E any](s S) iter.Seq2[int, E] {
+	index := int(time.Now().Unix()) % len(s)
+	return func(yield func(int, E) bool) {
+		for i := range len(s) {
+			r := RotateQueue1(index, i, len(s))
+			if !yield(r, s[r]) {
+				break
+			}
+		}
+	}
 }
