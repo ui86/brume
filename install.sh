@@ -423,13 +423,66 @@ remove_service_by_init() {
 # 防火墙检测与管理
 # ============================================================
 
+# 检查 UFW 是否已经由管理员启用
+is_ufw_active() {
+    local status
+
+    command -v ufw &> /dev/null || return 1
+    status=$(execute_privileged env LC_ALL=C ufw status 2>/dev/null | head -n1)
+    [[ "${status}" =~ ^Status:[[:space:]]+active$ ]]
+}
+
+# 获取 SSH 服务使用的端口，始终保护标准 SSH 端口
+get_ssh_ports() {
+    {
+        echo "22"
+
+        # 优先读取当前远程会话实际连接的服务端口
+        if [ -n "${SSH_CONNECTION:-}" ]; then
+            echo "${SSH_CONNECTION}" | awk 'NF >= 4 && $4 ~ /^[0-9]+$/ { print $4 }'
+        elif [ -n "${SSH_CLIENT:-}" ]; then
+            echo "${SSH_CLIENT}" | awk 'NF >= 3 && $3 ~ /^[0-9]+$/ { print $3 }'
+        fi
+
+        if command -v sshd &> /dev/null; then
+            execute_privileged sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'
+        fi
+
+        if command -v ss &> /dev/null; then
+            execute_privileged ss -H -ltnp 2>/dev/null | awk '
+                /sshd|dropbear/ {
+                    port = $4
+                    sub(/^.*:/, "", port)
+                    if (port ~ /^[0-9]+$/) print port
+                }
+            '
+        fi
+    } | sort -nu
+}
+
+# 防止防火墙规则误伤 SSH 服务
+validate_firewall_port() {
+    local port=$1
+    local ssh_port
+
+    while IFS= read -r ssh_port; do
+        if [ "${port}" = "${ssh_port}" ]; then
+            echo -e "${RED}端口 ${port} 是标准 SSH 端口或已被 SSH 服务使用${RESET}"
+            echo -e "${YELLOW}请为 Brume 选择其他端口，避免服务器失去远程连接${RESET}"
+            return 1
+        fi
+    done < <(get_ssh_ports)
+
+    return 0
+}
+
 # 检测可用的防火墙工具
 # 返回: firewalld / ufw / nftables / iptables / none
 detect_firewall() {
-    # 按优先级检测：firewalld > ufw > nftables > iptables
+    # 仅使用已启用的 UFW，避免脚本激活全局入站策略
     if command -v firewall-cmd &> /dev/null && execute_privileged firewall-cmd --state &> /dev/null; then
         echo "firewalld"
-    elif command -v ufw &> /dev/null && execute_privileged ufw status &> /dev/null; then
+    elif is_ufw_active; then
         echo "ufw"
     elif command -v nft &> /dev/null; then
         echo "nftables"
@@ -489,6 +542,12 @@ setup_firewall_ufw() {
 
     echo -e "${CYAN}使用 ufw 配置防火墙规则...${RESET}"
 
+    # 不主动启用 UFW，避免其全局默认策略阻断 SSH 等现有服务
+    if ! is_ufw_active; then
+        echo -e "${YELLOW}UFW 当前未启用，跳过 UFW 防火墙配置${RESET}"
+        return 1
+    fi
+
     # 先清除已有规则
     remove_firewall_ufw "${port}" 2>/dev/null
 
@@ -504,9 +563,6 @@ setup_firewall_ufw() {
 
     # 拒绝其他所有连接到该端口
     execute_privileged ufw deny to any port "${port}" proto tcp comment "brume-deny-default"
-
-    # 确保 ufw 已启用
-    echo "y" | execute_privileged ufw enable 2>/dev/null
 
     echo -e "${GREEN}ufw 防火墙规则配置完成${RESET}"
 }
@@ -639,16 +695,15 @@ remove_firewall_ufw() {
     fi
 
     if [ -n "${port}" ]; then
-        # 删除带有 brume 标识的规则（通过规则编号倒序删除避免索引偏移）
-        # 先获取所有规则编号
+        # 仅删除带有 Brume 注释的规则，避免误删同端口的现有规则
         local rule_nums
-        rule_nums=$(execute_privileged ufw status numbered 2>/dev/null | grep -E "(brume|${port}/tcp)" | grep -oP '^\[\s*\K[0-9]+' | sort -rn)
+        rule_nums=$(execute_privileged env LC_ALL=C ufw status numbered 2>/dev/null \
+            | grep -E '# brume-(whitelist|deny-default)([[:space:]]|$)' \
+            | grep -oP '^\[\s*\K[0-9]+' \
+            | sort -rn)
         for num in ${rule_nums}; do
             echo "y" | execute_privileged ufw delete "${num}" 2>/dev/null
         done
-
-        # 备选方案：直接按规则内容删除
-        execute_privileged ufw delete deny to any port "${port}" proto tcp 2>/dev/null
     fi
 
     echo -e "${GREEN}ufw 规则已清除${RESET}"
@@ -709,6 +764,10 @@ setup_firewall() {
     if [ -z "${whitelist}" ]; then
         echo -e "${YELLOW}未设置IP白名单，跳过防火墙配置${RESET}"
         return 0
+    fi
+
+    if ! validate_firewall_port "${port}"; then
+        return 1
     fi
 
     fw_type=$(detect_firewall)
@@ -1032,6 +1091,8 @@ get_action() {
 
 # 交互式获取安装配置参数
 get_install_config() {
+    local candidate_port
+
     # 重置参数为默认值
     port="${DEFAULT_PORT}"
     user="${DEFAULT_USER}"
@@ -1043,13 +1104,17 @@ get_install_config() {
     while true; do
         read -p "请输入Brume服务器端口号 [默认: ${DEFAULT_PORT}]: " input_port
         if [ -z "${input_port}" ]; then
-            port=${DEFAULT_PORT}
-            break
+            candidate_port=${DEFAULT_PORT}
         elif [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
-            port=${input_port}
-            break
+            candidate_port=${input_port}
         else
             echo -e "${RED}无效的端口号，请输入1-65535之间的数字${RESET}"
+            continue
+        fi
+
+        if validate_firewall_port "${candidate_port}"; then
+            port=${candidate_port}
+            break
         fi
     done
 
@@ -1126,6 +1191,7 @@ get_install_config() {
 get_modify_config() {
     local init_system=$1
     local service_file
+    local candidate_port
 
     # 根据 init 系统确定服务文件位置
     case "${init_system}" in
@@ -1209,12 +1275,17 @@ get_modify_config() {
     while true; do
         read -p "请输入Brume服务器端口号 [当前: ${port}]: " input_port
         if [ -z "${input_port}" ]; then
-            break
+            candidate_port=${port}
         elif [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
-            port=${input_port}
-            break
+            candidate_port=${input_port}
         else
             echo -e "${RED}无效的端口号，请输入1-65535之间的数字${RESET}"
+            continue
+        fi
+
+        if validate_firewall_port "${candidate_port}"; then
+            port=${candidate_port}
+            break
         fi
     done
 
@@ -1372,6 +1443,12 @@ upgrade() {
     # 1. 自动提取参数
     get_current_config_auto "${init_system}"
     echo -e "已提取当前配置: 端口 ${port}, 用户 ${user:-无}, 白名单 ${whitelist:-无限制}"
+
+    # 在停服前阻止防火墙规则误伤 SSH 端口
+    if [ -n "${whitelist}" ] && ! validate_firewall_port "${port}"; then
+        echo -e "${RED}更新已中止，请先修改 Brume 服务端口${RESET}"
+        return 1
+    fi
 
     # 2. 检测系统架构
     arch=$(check_architecture)
