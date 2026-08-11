@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 )
 
 var (
@@ -122,18 +123,13 @@ func NewRequestFrom(r io.Reader) (*Request, error) {
 	if bb[0] != Ver {
 		return nil, ErrVersion
 	}
-	var addr []byte
+	var addrLen int
+	var domainLen byte
 	switch bb[3] {
 	case ATYPIPv4:
-		addr = make([]byte, 4)
-		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
-		}
+		addrLen = net.IPv4len
 	case ATYPIPv6:
-		addr = make([]byte, 16)
-		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
-		}
+		addrLen = net.IPv6len
 	case ATYPDomain:
 		var dal [1]byte
 		if _, err := io.ReadFull(r, dal[:]); err != nil {
@@ -142,18 +138,23 @@ func NewRequestFrom(r io.Reader) (*Request, error) {
 		if dal[0] == 0 {
 			return nil, ErrBadRequest
 		}
-		addr = make([]byte, int(dal[0]))
-		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
-		}
-		addr = append(dal[:], addr...)
+		domainLen = dal[0]
+		addrLen = int(domainLen) + 1
 	default:
 		return nil, ErrBadRequest
 	}
-	port := make([]byte, 2)
-	if _, err := io.ReadFull(r, port); err != nil {
+
+	wire := make([]byte, addrLen+2)
+	readOffset := 0
+	if bb[3] == ATYPDomain {
+		wire[0] = domainLen
+		readOffset = 1
+	}
+	if _, err := io.ReadFull(r, wire[readOffset:]); err != nil {
 		return nil, err
 	}
+	addr := wire[:addrLen]
+	port := wire[addrLen:]
 	if Debug {
 		log.Printf("Got Request: %#v %#v %#v %#v %#v %#v\n", bb[0], bb[1], bb[2], bb[3], addr, port)
 	}
@@ -198,60 +199,67 @@ func (r *Reply) WriteTo(w io.Writer) (int64, error) {
 	return int64(i), nil
 }
 
-// NewDatagramFromBytes 从字节数组解析 UDP 数据报
-func NewDatagramFromBytes(bb []byte) (*Datagram, error) {
+// ParseDatagram 从字节数组零拷贝解析 UDP 数据报
+func ParseDatagram(bb []byte) (Datagram, error) {
 	n := len(bb)
 	minl := 4
 	if n < minl {
-		return nil, ErrBadRequest
+		return Datagram{}, ErrBadRequest
 	}
 	var addr []byte
 	switch bb[3] {
 	case ATYPIPv4:
 		minl += 4
 		if n < minl {
-			return nil, ErrBadRequest
+			return Datagram{}, ErrBadRequest
 		}
 		addr = bb[minl-4 : minl]
 	case ATYPIPv6:
 		minl += 16
 		if n < minl {
-			return nil, ErrBadRequest
+			return Datagram{}, ErrBadRequest
 		}
 		addr = bb[minl-16 : minl]
 	case ATYPDomain:
 		minl += 1
 		if n < minl {
-			return nil, ErrBadRequest
+			return Datagram{}, ErrBadRequest
 		}
 		l := bb[4]
 		if l == 0 {
-			return nil, ErrBadRequest
+			return Datagram{}, ErrBadRequest
 		}
 		minl += int(l)
 		if n < minl {
-			return nil, ErrBadRequest
+			return Datagram{}, ErrBadRequest
 		}
-		addr = bb[minl-int(l) : minl]
-		addr = append([]byte{l}, addr...)
+		addr = bb[4:minl]
 	default:
-		return nil, ErrBadRequest
+		return Datagram{}, ErrBadRequest
 	}
 	minl += 2
 	if n <= minl {
-		return nil, ErrBadRequest
+		return Datagram{}, ErrBadRequest
 	}
 	port := bb[minl-2 : minl]
 	data := bb[minl:]
-	d := &Datagram{
+	return Datagram{
 		Rsv:     bb[0:2],
 		Frag:    bb[2],
 		Atyp:    bb[3],
 		DstAddr: addr,
 		DstPort: port,
 		Data:    data,
+	}, nil
+}
+
+// NewDatagramFromBytes 从字节数组解析 UDP 数据报
+func NewDatagramFromBytes(bb []byte) (*Datagram, error) {
+	d, err := ParseDatagram(bb)
+	if err != nil {
+		return nil, err
 	}
-	return d, nil
+	return &d, nil
 }
 
 // NewDatagram 创建一个新的 UDP 数据报结构体
@@ -269,13 +277,25 @@ func NewDatagram(atyp byte, dstaddr []byte, dstport []byte, data []byte) *Datagr
 	}
 }
 
+// HeaderLen 返回 SOCKS5 UDP 数据报头长度
+func (d *Datagram) HeaderLen() int {
+	return len(d.Rsv) + 2 + len(d.DstAddr) + len(d.DstPort)
+}
+
+// AppendHeaderTo 将 SOCKS5 UDP 数据报头追加到目标缓冲区
+func (d *Datagram) AppendHeaderTo(dst []byte) []byte {
+	dst = append(dst, d.Rsv...)
+	dst = append(dst, d.Frag, d.Atyp)
+	dst = append(dst, d.DstAddr...)
+	return append(dst, d.DstPort...)
+}
+
+// AppendTo 将完整 SOCKS5 UDP 数据报追加到目标缓冲区
+func (d *Datagram) AppendTo(dst []byte) []byte {
+	dst = d.AppendHeaderTo(dst)
+	return append(dst, d.Data...)
+}
+
 func (d *Datagram) Bytes() []byte {
-	b := make([]byte, 0, len(d.Rsv)+1+1+len(d.DstAddr)+len(d.DstPort)+len(d.Data))
-	b = append(b, d.Rsv...)
-	b = append(b, d.Frag)
-	b = append(b, d.Atyp)
-	b = append(b, d.DstAddr...)
-	b = append(b, d.DstPort...)
-	b = append(b, d.Data...)
-	return b
+	return d.AppendTo(make([]byte, 0, d.HeaderLen()+len(d.Data)))
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -22,17 +23,27 @@ var (
 	ErrUserPassAuth = errors.New("Invalid Username or Password for Auth")
 )
 
+const (
+	tcpBufferSize          = 32 * 1024
+	maxUDPPayloadSize      = 65507
+	maxSOCKS5UDPHeaderSize = 262
+	udpQueueCapacity       = 1024
+)
+
+type tcpBuffer [tcpBufferSize]byte
+type udpBuffer [maxUDPPayloadSize + maxSOCKS5UDPHeaderSize]byte
+
 // tcpBufPool 用于 TCP 复制的 32KB 缓冲区池
 var tcpBufPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 32*1024)
+		return new(tcpBuffer)
 	},
 }
 
-// udpBufPool 用于 UDP 数据包的 64KB 缓冲区池
+// udpBufPool 为最大 UDP 数据包预留 SOCKS5 头部空间
 var udpBufPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 65507)
+		return new(udpBuffer)
 	},
 }
 
@@ -55,17 +66,17 @@ type Server struct {
 	LimitUDP          bool
 
 	// 白名单优化：支持精确IP和CIDR网段
-	AllowedIPs   map[string]struct{}
-	AllowedCIDRs []*net.IPNet
+	AllowedIPs   map[netip.Addr]struct{}
+	AllowedCIDRs []netip.Prefix
 
 	// UDP 并发处理通道
-	udpWorkCh chan *udpTask
+	udpWorkCh chan udpTask
 }
 
 // udpTask 封装 UDP 处理任务
 type udpTask struct {
 	addr *net.UDPAddr
-	buf  []byte
+	buf  *udpBuffer
 	n    int
 }
 
@@ -89,24 +100,24 @@ func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeou
 	}
 
 	// 解析白名单：区分普通IP和CIDR网段
-	allowedIPs := make(map[string]struct{})
-	var allowedCIDRs []*net.IPNet
+	allowedIPs := make(map[netip.Addr]struct{})
+	var allowedCIDRs []netip.Prefix
 
 	for _, s := range whiteList {
 		s = strings.TrimSpace(s)
 		if s == "" {
 			continue
 		}
-		// 尝试解析为 CIDR (e.g. 192.168.1.0/24)
-		_, ipNet, err := net.ParseCIDR(s)
+		// 尝试解析为 CIDR（例如 192.168.1.0/24）
+		prefix, err := netip.ParsePrefix(s)
 		if err == nil {
-			allowedCIDRs = append(allowedCIDRs, ipNet)
+			allowedCIDRs = append(allowedCIDRs, prefix.Masked())
 			continue
 		}
-		// 尝试解析为普通 IP (e.g. 1.2.3.4)
-		ip := net.ParseIP(s)
-		if ip != nil {
-			allowedIPs[ip.String()] = struct{}{}
+		// 尝试解析为普通 IP（例如 1.2.3.4）
+		ip, err := netip.ParseAddr(s)
+		if err == nil {
+			allowedIPs[ip.Unmap()] = struct{}{}
 			continue
 		}
 		log.Printf("Warning: Invalid whitelist entry skipped: %s", s)
@@ -127,7 +138,7 @@ func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeou
 		RunnerGroup:       runnergroup.New(),
 		AllowedIPs:        allowedIPs,
 		AllowedCIDRs:      allowedCIDRs,
-		udpWorkCh:         make(chan *udpTask, 5000), // 缓冲区大小可调整
+		udpWorkCh:         make(chan udpTask, udpQueueCapacity),
 	}
 	return s, nil
 }
@@ -139,14 +150,20 @@ func (s *Server) IsAllowed(ip net.IP) bool {
 		return true
 	}
 
-	// 1. 精确匹配 (O(1))
-	if _, ok := s.AllowedIPs[ip.String()]; ok {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+
+	// 1. 精确匹配（O(1)）
+	if _, ok := s.AllowedIPs[addr]; ok {
 		return true
 	}
 
-	// 2. CIDR 网段匹配 (O(N))
-	for _, ipNet := range s.AllowedCIDRs {
-		if ipNet.Contains(ip) {
+	// 2. CIDR 网段匹配（O(N)）
+	for _, prefix := range s.AllowedCIDRs {
+		if prefix.Contains(addr) {
 			return true
 		}
 	}
@@ -293,19 +310,19 @@ func (s *Server) ListenAndServe(h Handler) error {
 	s.RunnerGroup.Add(&runnergroup.Runner{
 		Start: func() error {
 			for {
-				b := udpBufPool.Get().([]byte)
-				b = b[:cap(b)] // 重置长度
+				buffer := udpBufPool.Get().(*udpBuffer)
+				b := buffer[:maxUDPPayloadSize]
 
 				n, addr, err := s.UDPConn.ReadFromUDP(b)
 				if err != nil {
-					udpBufPool.Put(b)
+					udpBufPool.Put(buffer)
 					return err
 				}
 
 				select {
-				case s.udpWorkCh <- &udpTask{addr: addr, buf: b, n: n}:
+				case s.udpWorkCh <- udpTask{addr: addr, buf: buffer, n: n}:
 				default:
-					udpBufPool.Put(b)
+					udpBufPool.Put(buffer)
 					if Debug {
 						log.Println("UDP worker queue full, dropping packet")
 					}
@@ -321,7 +338,7 @@ func (s *Server) ListenAndServe(h Handler) error {
 }
 
 // handleUDPTask 处理单个 UDP 任务
-func handleUDPTask(s *Server, t *udpTask) {
+func handleUDPTask(s *Server, t udpTask) {
 	defer udpBufPool.Put(t.buf)
 
 	// 优化：UDP 包入口检查白名单
@@ -332,11 +349,19 @@ func handleUDPTask(s *Server, t *udpTask) {
 		return
 	}
 
-	d, err := NewDatagramFromBytes(t.buf[0:t.n])
-	if err != nil {
+	if h, ok := s.Handle.(*DefaultHandle); ok {
+		d, err := ParseDatagram(t.buf[0:t.n])
+		if err != nil || d.Frag != 0x00 {
+			return
+		}
+		if err := h.handleUDP(s, t.addr, d); err != nil {
+			log.Println(err)
+		}
 		return
 	}
-	if d.Frag != 0x00 {
+
+	d, err := NewDatagramFromBytes(t.buf[0:t.n])
+	if err != nil || d.Frag != 0x00 {
 		return
 	}
 	if err := s.Handle.UDPHandle(s, t.addr, d); err != nil {
@@ -384,10 +409,10 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
 
 		// 优化：使用 io.CopyBuffer 实现零拷贝转发
 		directTransfer := func(dst net.Conn, src net.Conn, timeout int) {
-			buf := tcpBufPool.Get().([]byte)
+			buf := tcpBufPool.Get().(*tcpBuffer)
 			defer tcpBufPool.Put(buf)
 			srcWrapped := &idleTimeoutConn{Conn: src, timeout: time.Duration(timeout) * time.Second}
-			_, _ = io.CopyBuffer(dst, srcWrapped, buf)
+			_, _ = io.CopyBuffer(dst, srcWrapped, buf[:])
 		}
 
 		go directTransfer(c, rc, s.TCPTimeout)
@@ -411,6 +436,11 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
 
 // UDPHandle 处理 UDP 数据报转发逻辑
 func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) error {
+	return h.handleUDP(s, addr, *d)
+}
+
+// handleUDP 使用值类型数据报执行默认转发路径
+func (h *DefaultHandle) handleUDP(s *Server, addr *net.UDPAddr, d Datagram) error {
 	src := addr.String()
 	var ch chan byte
 	if s.LimitUDP {
@@ -471,8 +501,9 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 			ue.RemoteConn.Close()
 			s.UDPExchanges.Delete(ue.ClientAddr.String() + dst)
 		}()
-		b := udpBufPool.Get().([]byte)
-		defer udpBufPool.Put(b)
+		buffer := udpBufPool.Get().(*udpBuffer)
+		defer udpBufPool.Put(buffer)
+		b := buffer[:]
 
 		for {
 			if ch != nil {
@@ -485,7 +516,7 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 			if s.UDPTimeout != 0 {
 				ue.RemoteConn.SetDeadline(time.Now().Add(time.Duration(s.UDPTimeout) * time.Second))
 			}
-			buf := b[:cap(b)]
+			buf := b[maxSOCKS5UDPHeaderSize : maxSOCKS5UDPHeaderSize+maxUDPPayloadSize]
 			n, err := ue.RemoteConn.Read(buf)
 			if err != nil {
 				return
@@ -518,7 +549,10 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 			}
 
 			d1 := NewDatagram(a, addr, port, buf[0:n])
-			if _, err := s.UDPConn.WriteToUDP(d1.Bytes(), ue.ClientAddr); err != nil {
+			packetStart := maxSOCKS5UDPHeaderSize - d1.HeaderLen()
+			packet := d1.AppendHeaderTo(b[packetStart:packetStart])
+			packet = append(packet, buf[0:n]...)
+			if _, err := s.UDPConn.WriteToUDP(packet, ue.ClientAddr); err != nil {
 				return
 			}
 		}

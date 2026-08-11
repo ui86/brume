@@ -142,6 +142,7 @@ sudo mv brume /usr/local/bin/
 - 服务器使用goroutine处理每个客户端连接，具有良好的并发性能
 - 启用认证和白名单功能可以提高服务器安全性
 - 可以通过设置超时时间避免空闲连接占用资源
+- [核心性能基准与优化对比](docs/benchmark-comparison.md)
 
 ## License
 

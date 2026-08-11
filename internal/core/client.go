@@ -141,7 +141,7 @@ func (c *Client) Read(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	d, err := NewDatagramFromBytes(b[0:n])
+	d, err := ParseDatagram(b[0:n])
 	if err != nil {
 		return 0, err
 	}
@@ -154,8 +154,11 @@ func (c *Client) Write(b []byte) (int, error) {
 	if c.UDPConn == nil {
 		return c.TCPConn.Write(b)
 	}
+	packetBuffer := udpBufPool.Get().(*udpBuffer)
+	defer udpBufPool.Put(packetBuffer)
+
 	d := NewDatagram(c.dstAtyp, c.dstAddr, c.dstPort, b)
-	b1 := d.Bytes()
+	b1 := d.AppendTo(packetBuffer[:0])
 	n, err := c.UDPConn.Write(b1)
 	if err != nil {
 		return 0, err

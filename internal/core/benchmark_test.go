@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"net/netip"
+	"runtime"
+	"strconv"
 	"testing"
 )
 
@@ -15,6 +18,7 @@ var (
 	benchmarkErr      error
 	benchmarkRequest  *Request
 	benchmarkDatagram *Datagram
+	benchmarkDgramVal Datagram
 	benchmarkBytes    []byte
 	benchmarkWritten  int64
 )
@@ -37,7 +41,7 @@ func makeBenchmarkRequestPacket(atyp byte, addr []byte) []byte {
 
 // BenchmarkServerIsAllowed 测量白名单精确匹配和网段匹配的开销。
 func BenchmarkServerIsAllowed(b *testing.B) {
-	_, cidr, err := net.ParseCIDR("192.0.2.0/24")
+	cidr, err := netip.ParsePrefix("192.0.2.0/24")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -56,21 +60,21 @@ func BenchmarkServerIsAllowed(b *testing.B) {
 		},
 		{
 			name: "精确匹配",
-			server: &Server{AllowedIPs: map[string]struct{}{
-				"198.51.100.10": {},
+			server: &Server{AllowedIPs: map[netip.Addr]struct{}{
+				netip.MustParseAddr("198.51.100.10"): {},
 			}},
 			ip:   net.ParseIP("198.51.100.10"),
 			want: true,
 		},
 		{
 			name:   "网段匹配",
-			server: &Server{AllowedCIDRs: []*net.IPNet{cidr}},
+			server: &Server{AllowedCIDRs: []netip.Prefix{cidr}},
 			ip:     net.ParseIP("192.0.2.10"),
 			want:   true,
 		},
 		{
 			name:   "未匹配",
-			server: &Server{AllowedCIDRs: []*net.IPNet{cidr}},
+			server: &Server{AllowedCIDRs: []netip.Prefix{cidr}},
 			ip:     net.ParseIP("198.51.100.10"),
 			want:   false,
 		},
@@ -89,6 +93,51 @@ func BenchmarkServerIsAllowed(b *testing.B) {
 			}
 		})
 	}
+}
+
+// BenchmarkServerIsAllowedCIDRScale 测量未命中时网段数量增长带来的线性开销。
+func BenchmarkServerIsAllowedCIDRScale(b *testing.B) {
+	for _, size := range []int{1, 16, 64, 256} {
+		prefixes := make([]netip.Prefix, 0, size)
+		for i := range size {
+			addr := netip.AddrFrom4([4]byte{10, byte(i), 0, 0})
+			prefixes = append(prefixes, netip.PrefixFrom(addr, 16))
+		}
+		server := &Server{AllowedCIDRs: prefixes}
+		ip := net.ParseIP("203.0.113.10")
+
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				benchmarkAllowed = server.IsAllowed(ip)
+			}
+			b.StopTimer()
+			if benchmarkAllowed {
+				b.Fatal("未命中地址被错误放行")
+			}
+		})
+	}
+}
+
+// BenchmarkServerIsAllowedParallel 测量并发读取白名单的开销。
+func BenchmarkServerIsAllowedParallel(b *testing.B) {
+	server := &Server{AllowedIPs: map[netip.Addr]struct{}{
+		netip.MustParseAddr("198.51.100.10"): {},
+	}}
+	ip := net.ParseIP("198.51.100.10")
+	if !server.IsAllowed(ip) {
+		b.Fatal("精确匹配地址未被放行")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var allowed bool
+		for pb.Next() {
+			allowed = server.IsAllowed(ip)
+		}
+		runtime.KeepAlive(allowed)
+	})
 }
 
 // BenchmarkParseAddress 测量文本地址转换为 SOCKS5 地址字段的开销。
@@ -226,6 +275,54 @@ func BenchmarkDatagramBytes(b *testing.B) {
 				b.Fatal("数据报编码结果为空")
 			}
 		})
+	}
+}
+
+// BenchmarkDatagramAppendTo 测量复用缓冲区时的 UDP 数据报编码开销。
+func BenchmarkDatagramAppendTo(b *testing.B) {
+	dgram := NewDatagram(ATYPIPv4, []byte{192, 0, 2, 10}, []byte{0x01, 0xbb}, bytes.Repeat([]byte{0xab}, 1024))
+	buffer := make([]byte, 0, dgram.HeaderLen()+len(dgram.Data))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkBytes = dgram.AppendTo(buffer[:0])
+	}
+	b.StopTimer()
+	if len(benchmarkBytes) == 0 {
+		b.Fatal("数据报编码结果为空")
+	}
+}
+
+// BenchmarkDatagramAppendToPool 测量生产路径中池化缓冲区的编码开销。
+func BenchmarkDatagramAppendToPool(b *testing.B) {
+	dgram := NewDatagram(ATYPIPv4, []byte{192, 0, 2, 10}, []byte{0x01, 0xbb}, bytes.Repeat([]byte{0xab}, 1024))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		buffer := udpBufPool.Get().(*udpBuffer)
+		benchmarkBytes = dgram.AppendTo(buffer[:0])
+		udpBufPool.Put(buffer)
+	}
+	b.StopTimer()
+	if len(benchmarkBytes) == 0 {
+		b.Fatal("数据报编码结果为空")
+	}
+}
+
+// BenchmarkParseDatagram 测量返回值形式的 UDP 数据报解析开销。
+func BenchmarkParseDatagram(b *testing.B) {
+	packet := NewDatagram(ATYPIPv4, []byte{192, 0, 2, 10}, []byte{0x01, 0xbb}, bytes.Repeat([]byte{0xab}, 1024)).Bytes()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkDgramVal, benchmarkErr = ParseDatagram(packet)
+	}
+	b.StopTimer()
+	if benchmarkErr != nil {
+		b.Fatal(benchmarkErr)
+	}
+	if len(benchmarkDgramVal.Data) == 0 {
+		b.Fatal("数据报解析结果为空")
 	}
 }
 
