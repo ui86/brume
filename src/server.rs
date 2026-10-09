@@ -23,6 +23,7 @@ struct Association {
     requested_port: u16,
     endpoint: Mutex<Option<SocketAddr>>,
     alive: AtomicBool,
+    stopped: CancellationToken,
     flows: Mutex<HashMap<Target, Arc<Flow>>>,
 }
 
@@ -177,6 +178,7 @@ impl Server {
         self.shutdown.cancel();
         for association in self.associations.lock().unwrap().values() {
             association.alive.store(false, Ordering::Relaxed);
+            association.stopped.cancel();
         }
         let udp_result = udp_task
             .await
@@ -440,6 +442,7 @@ async fn associate(
         requested_port: target.port,
         endpoint: Mutex::new(None),
         alive: AtomicBool::new(true),
+        stopped: CancellationToken::new(),
         flows: Mutex::new(HashMap::new()),
     });
     associations
@@ -448,6 +451,7 @@ async fn associate(
         .insert(id, Arc::clone(&association));
     if let Err(error) = protocol::write_reply_async(&mut stream, protocol::SUCCESS, relay).await {
         association.alive.store(false, Ordering::Relaxed);
+        association.stopped.cancel();
         associations.lock().unwrap().remove(&id);
         return Err(error);
     }
@@ -464,6 +468,7 @@ async fn associate(
         }
     }
     association.alive.store(false, Ordering::Relaxed);
+    association.stopped.cancel();
     associations.lock().unwrap().remove(&id);
     Ok(())
 }
@@ -589,7 +594,9 @@ async fn handle_udp_packet(
     };
 
     *flow.last_activity.lock().unwrap() = Instant::now();
-    let _ = flow.socket.send(&payload).await;
+    if flow.socket.send(&payload).await.is_ok() {
+        *flow.last_activity.lock().unwrap() = Instant::now();
+    }
 }
 
 async fn receive_remote(
@@ -602,15 +609,30 @@ async fn receive_remote(
 ) {
     let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
     while association.alive.load(Ordering::Relaxed) {
-        let recv_future = flow.socket.recv(&mut buffer[22..]);
-        let res = if !timeout.is_zero() {
-            tokio::time::timeout(timeout, recv_future).await
+        let deadline = if timeout.is_zero() {
+            None
         } else {
-            Ok(recv_future.await)
+            let deadline = *flow.last_activity.lock().unwrap() + timeout;
+            if Instant::now() >= deadline {
+                break;
+            }
+            Some(tokio::time::Instant::from_std(deadline))
+        };
+        let received = if let Some(deadline) = deadline {
+            tokio::select! {
+                _ = association.stopped.cancelled() => break,
+                _ = tokio::time::sleep_until(deadline) => continue,
+                result = flow.socket.recv(&mut buffer[22..]) => result,
+            }
+        } else {
+            tokio::select! {
+                _ = association.stopped.cancelled() => break,
+                result = flow.socket.recv(&mut buffer[22..]) => result,
+            }
         };
 
-        match res {
-            Ok(Ok(length)) => {
+        match received {
+            Ok(length) => {
                 if !association.alive.load(Ordering::Relaxed) {
                     break;
                 }
@@ -623,7 +645,6 @@ async fn receive_remote(
                     let _ = relay.send_to(&buffer[start..22 + length], source).await;
                 }
             }
-            Ok(Err(_)) => break,
             Err(_) => break,
         }
     }
@@ -711,6 +732,77 @@ mod tests {
         let mut reply = [0; 10];
         stream.read_exact(&mut reply).unwrap();
         reply
+    }
+
+    async fn test_udp_flow() -> (
+        Arc<Association>,
+        Arc<Flow>,
+        Arc<tokio::net::UdpSocket>,
+        Target,
+        SocketAddr,
+    ) {
+        let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = remote.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(destination).await.unwrap();
+        let flow = Arc::new(Flow {
+            socket: Arc::new(socket),
+            last_activity: Mutex::new(Instant::now()),
+        });
+        let target = Target::from(destination);
+        let association = Arc::new(Association {
+            client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            requested_port: 0,
+            endpoint: Mutex::new(None),
+            alive: AtomicBool::new(true),
+            stopped: CancellationToken::new(),
+            flows: Mutex::new(HashMap::from([(target.clone(), Arc::clone(&flow))])),
+        });
+        let relay = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        (association, flow, relay, target, destination)
+    }
+
+    #[tokio::test]
+    async fn closed_udp_association_stops_unlimited_flow() {
+        let (association, flow, relay, target, destination) = test_udp_flow().await;
+        let task = tokio::spawn(receive_remote(
+            Arc::clone(&flow),
+            relay,
+            Arc::clone(&association),
+            target,
+            destination,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await;
+        association.alive.store(false, Ordering::Relaxed);
+        association.stopped.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(association.flows.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn outgoing_udp_activity_extends_flow_lifetime() {
+        let (association, flow, relay, target, destination) = test_udp_flow().await;
+        let task = tokio::spawn(receive_remote(
+            Arc::clone(&flow),
+            relay,
+            Arc::clone(&association),
+            target,
+            destination,
+            Duration::from_millis(300),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        *flow.last_activity.lock().unwrap() = Instant::now();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished());
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(association.flows.lock().unwrap().is_empty());
     }
 
     #[test]
