@@ -388,6 +388,8 @@ async fn handle_client(
     id: u64,
     shutdown: CancellationToken,
 ) -> io::Result<()> {
+    // 协商及转发小报文时避免 Nagle 引入额外等待
+    stream.set_nodelay(true)?;
     tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiate(&mut stream, &config))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 协商超时"))??;
@@ -453,6 +455,7 @@ async fn connect(
                 return Err(error);
             }
         };
+        remote.set_nodelay(true)?;
 
         protocol::write_reply_async(&mut client, protocol::SUCCESS, remote.local_addr()?).await?;
         forward_bidirectional(&mut client, &mut remote, timeout).await

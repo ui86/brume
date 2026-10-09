@@ -109,6 +109,8 @@ impl Client {
 
     fn negotiate(&self) -> io::Result<TcpStream> {
         let mut stream = connect_proxy(self.server.clone())?;
+        // SOCKS5 协商使用多个小报文，关闭 Nagle 以减少交互等待
+        stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
         stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
         let method = if self.username.is_empty() { 0 } else { 2 };
