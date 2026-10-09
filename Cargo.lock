@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "brume"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "ctrlc",
  "hickory-resolver",
