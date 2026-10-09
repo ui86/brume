@@ -24,6 +24,9 @@ fn connector_runtime() -> io::Result<&'static Runtime> {
 }
 
 fn connect_proxy(server: String) -> io::Result<TcpStream> {
+    if let Ok(address) = server.parse::<SocketAddr>() {
+        return TcpStream::connect_timeout(&address, CONNECT_TIMEOUT);
+    }
     let (sender, receiver) = mpsc::sync_channel(1);
     let task = connector_runtime()?.spawn(async move {
         let result = tokio::time::timeout(CONNECT_TIMEOUT, async {
