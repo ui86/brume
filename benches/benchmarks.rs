@@ -111,6 +111,7 @@ fn udp_roundtrip_benchmark() {
         whitelist: Whitelist::parse("127.0.0.1").unwrap(),
         tcp_timeout: None,
         udp_timeout: Duration::from_secs(60),
+        dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
     };
     let server = Server::bind(config, Arc::clone(&shutdown)).unwrap();
     let server_addr = SocketAddr::new(
@@ -188,6 +189,7 @@ fn tcp_benchmarks() {
         whitelist: Whitelist::parse("127.0.0.1").unwrap(),
         tcp_timeout: None,
         udp_timeout: Duration::from_secs(60),
+        dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
     };
     let server = Server::bind(config, Arc::clone(&shutdown)).unwrap();
     let address = SocketAddr::new(

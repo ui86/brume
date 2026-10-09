@@ -13,6 +13,7 @@ DEFAULT_PASSWORD=""
 DEFAULT_WHITELIST=""
 DEFAULT_TCP_TIMEOUT=0
 DEFAULT_UDP_TIMEOUT=60
+DEFAULT_DNS_SERVERS="8.8.8.8,1.1.1.1"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="brume"
 CONFIG_DIR="/etc/brume"
@@ -46,7 +47,7 @@ write_config_file() {
             return 1
         fi
     done
-    install -d -m 700 "${CONFIG_DIR}" || return 1
+    mkdir -p -m 700 "${CONFIG_DIR}" || return 1
     chmod 700 "${CONFIG_DIR}" || return 1
     temp_file=$(mktemp "${CONFIG_DIR}/.brume.conf.XXXXXX") || return 1
     if ! {
@@ -56,6 +57,9 @@ write_config_file() {
         printf 'whitelist=%s\n' "$4"
         printf 'tcp_timeout=%s\n' "$5"
         printf 'udp_timeout=%s\n' "$6"
+        if [ "${7:-${DEFAULT_DNS_SERVERS}}" != "${DEFAULT_DNS_SERVERS}" ]; then
+            printf 'dns_servers=%s\n' "$7"
+        fi
     } > "${temp_file}"; then
         rm -f "${temp_file}"
         return 1
@@ -86,6 +90,7 @@ load_config_file() {
             whitelist) whitelist=${value} ;;
             tcp_timeout) tcp_timeout=${value} ;;
             udp_timeout) udp_timeout=${value} ;;
+            dns_servers) dns_servers=${value} ;;
             *) echo "配置文件包含未知配置项" >&2; return 1 ;;
         esac
     done < "${CONFIG_FILE}"
@@ -397,6 +402,23 @@ restart_service_by_init() {
     echo -e "${GREEN}服务重启成功${RESET}"
 }
 
+# 更新的重启交给独立进程，避免代理断开后中断安装脚本
+schedule_upgrade_restart() {
+    local init_system=$1
+    echo "正在安排服务重启；经过 Brume 的 SSH 连接可能短暂断开，请稍后重连。"
+    case "${init_system}" in
+        systemd)
+            execute_privileged systemctl restart --no-block "${SERVICE_NAME}"
+            ;;
+        openrc)
+            nohup sh -c 'sleep 1; rc-service brume restart' </dev/null >/var/log/brume-upgrade.log 2>&1 &
+            ;;
+        sysvinit)
+            nohup sh -c 'sleep 1; /etc/init.d/brume restart' </dev/null >/var/log/brume-upgrade.log 2>&1 &
+            ;;
+    esac
+}
+
 # 根据 init 系统卸载服务
 remove_service_by_init() {
     local init_system=$1
@@ -460,8 +482,13 @@ get_ssh_ports() {
             echo "${SSH_CLIENT}" | awk 'NF >= 3 && $3 ~ /^[0-9]+$/ { print $3 }'
         fi
 
+        # 部分发行版的 root PATH 不含 /usr/sbin，仍需读取 SSH 配置端口
         if command -v sshd &> /dev/null; then
             execute_privileged sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'
+        elif [ -x /usr/sbin/sshd ]; then
+            execute_privileged /usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'
+        elif [ -x /sbin/sshd ]; then
+            execute_privileged /sbin/sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'
         fi
 
         if command -v ss &> /dev/null; then
@@ -714,6 +741,7 @@ remove_firewall_ufw() {
         # 仅删除带有 Brume 注释的规则，避免误删同端口的现有规则
         local rule_nums
         rule_nums=$(execute_privileged env LC_ALL=C ufw status numbered 2>/dev/null \
+            | grep -E "^\\[[[:space:]]*[0-9]+\\][[:space:]]+${port}/tcp([[:space:]]|$)" \
             | grep -E '# brume-(whitelist|deny-default)([[:space:]]|$)' \
             | grep -oP '^\[\s*\K[0-9]+' \
             | sort -rn)
@@ -871,6 +899,12 @@ binary_supports_config() {
     [[ "${help}" == *--config* ]]
 }
 
+binary_supports_dns() {
+    local help
+    help=$("$1" --help 2>&1) || return 1
+    [[ "${help}" == *--dns-servers* ]]
+}
+
 prepare_binary() {
     local version=$1
     local arch=$2
@@ -898,18 +932,31 @@ prepare_binary() {
         rm -rf "${prepared_dir}"
         exit 1
     fi
+
+    # 当前配置显式使用自定义 DNS 时，拒绝安装不兼容的旧版本
+    if [ -f "${CONFIG_FILE}" ] \
+        && grep -Eq '^[[:space:]]*dns_servers[[:space:]]*=' "${CONFIG_FILE}" \
+        && ! binary_supports_dns "${prepared_dir}/brume"; then
+        echo -e "${RED}该版本不支持 dns_servers，请选择包含 --dns-servers 功能的新版本${RESET}"
+        rm -rf "${prepared_dir}"
+        exit 1
+    fi
 }
 
 # 安装已经验证过的二进制文件
 install_prepared_binary() {
+    local staged_binary
     echo "安装到 ${INSTALL_DIR}..."
-    if ! execute_privileged mv "${prepared_dir}/brume" "${INSTALL_DIR}"; then
+    staged_binary=$(mktemp "${INSTALL_DIR}/.brume.XXXXXX") || return 1
+    if ! execute_privileged cp "${prepared_dir}/brume" "${staged_binary}" \
+        || ! execute_privileged chmod 755 "${staged_binary}" \
+        || ! execute_privileged mv -f "${staged_binary}" "${INSTALL_DIR}/brume"; then
         echo -e "${RED}安装失败，请检查权限${RESET}"
+        rm -f "${staged_binary}"
         rm -rf "${prepared_dir}"
         exit 1
     fi
 
-    execute_privileged chmod +x "${INSTALL_DIR}/brume"
     rm -rf "${prepared_dir}"
     prepared_dir=""
     echo -e "${GREEN}安装成功${RESET}"
@@ -991,7 +1038,7 @@ modify() {
         echo -e "${RED}当前程序不支持配置文件，请先更新到包含 --config 功能的版本${RESET}"
         return 1
     fi
-    write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" || return 1
+    write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}" || return 1
 
     # 停止服务
     stop_service_by_init "${init_system}"
@@ -1115,6 +1162,7 @@ get_install_config() {
     whitelist="${DEFAULT_WHITELIST}"
     tcp_timeout="${DEFAULT_TCP_TIMEOUT}"
     udp_timeout="${DEFAULT_UDP_TIMEOUT}"
+    dns_servers="${DEFAULT_DNS_SERVERS}"
     version=""
 
     # 获取端口号
@@ -1391,6 +1439,7 @@ get_current_config_auto() {
     whitelist=""
     tcp_timeout="${DEFAULT_TCP_TIMEOUT}"
     udp_timeout="${DEFAULT_UDP_TIMEOUT}"
+    dns_servers="${DEFAULT_DNS_SERVERS}"
     uses_config_file=false
 
     if [[ " ${cmd_args} " == *" --config "* ]]; then
@@ -1428,12 +1477,6 @@ upgrade() {
     get_current_config_auto "${init_system}" || return 1
     echo -e "已提取当前配置: 端口 ${port}, 用户 ${user:-无}, 白名单 ${whitelist:-无限制}"
 
-    # 在停服前阻止防火墙规则误伤 SSH 端口
-    if [ -n "${whitelist}" ] && ! validate_firewall_port "${port}"; then
-        echo -e "${RED}更新已中止，请先修改 Brume 服务端口${RESET}"
-        return 1
-    fi
-
     # 2. 检测系统架构
     arch=$(check_architecture)
     
@@ -1441,12 +1484,12 @@ upgrade() {
     version=$(get_latest_version)
     echo -e "准备更新至版本: ${version}"
 
-    # 4. 停服前下载并检查新程序
+    # 4. 下载并检查新程序
     prepare_binary "${version}" "${arch}"
 
-    # 5. 停服前迁移旧配置或收紧已有文件权限
+    # 5. 迁移旧配置或收紧已有文件权限
     if [ "${uses_config_file}" != true ]; then
-        if ! write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}"; then
+        if ! write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}"; then
             rm -rf "${prepared_dir}"
             return 1
         fi
@@ -1457,21 +1500,13 @@ upgrade() {
         fi
     fi
 
-    # 6. 停服并清理旧规则（为了重新安全挂载）
-    stop_service_by_init "${init_system}"
-    if [ -n "${whitelist}" ]; then
-        remove_firewall "${port}"
-    fi
+    # 6. 保持旧进程运行，原子替换程序并更新服务定义
+    install_prepared_binary || return 1
+    create_service "${init_system}" || return 1
 
-    # 7. 安装并配置已经检查的新程序
-    install_prepared_binary
-    create_service "${init_system}"
-    setup_firewall "${port}" "${whitelist}"
-
-    # 8. 重启服务
-    restart_service_by_init "${init_system}"
-
-    echo -e "${GREEN}Brume 服务器一键更新完成！${RESET}"
+    # 7. 端口和白名单未改变，无需重建防火墙规则
+    echo -e "${GREEN}新版本已安装，正在安排服务自动重启${RESET}"
+    schedule_upgrade_restart "${init_system}"
 }
 
 # ============================================================
@@ -1530,7 +1565,7 @@ main() {
             download_and_install "${version}" "${arch}"
 
             # 创建仅使用配置文件路径的服务
-            write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" || exit 1
+            write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}" || exit 1
             create_service "${init_system}"
 
             # 设置防火墙规则

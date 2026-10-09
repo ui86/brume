@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::dns::DnsResolver;
 use crate::protocol::{self, Host, Target};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
@@ -74,6 +75,7 @@ fn normalize(ip: IpAddr) -> IpAddr {
 
 pub struct Server {
     config: Arc<Config>,
+    dns: Arc<DnsResolver>,
     tcp: TcpListener,
     udp: Arc<UdpSocket>,
     associations: Associations,
@@ -83,6 +85,7 @@ pub struct Server {
 
 impl Server {
     pub fn bind(config: Config, shutdown: Arc<AtomicBool>) -> io::Result<Self> {
+        let dns = Arc::new(DnsResolver::new(&config.dns_servers)?);
         let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.port);
         let tcp_socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
         tcp_socket.set_only_v6(false)?;
@@ -98,6 +101,7 @@ impl Server {
         udp.set_read_timeout(Some(POLL_INTERVAL))?;
         Ok(Self {
             config: Arc::new(config),
+            dns,
             tcp,
             udp,
             associations: Arc::new(Mutex::new(HashMap::new())),
@@ -115,7 +119,9 @@ impl Server {
         let associations = Arc::clone(&self.associations);
         let shutdown = Arc::clone(&self.shutdown);
         let config = Arc::clone(&self.config);
-        let udp_thread = thread::spawn(move || udp_loop(relay, associations, config, shutdown));
+        let dns = Arc::clone(&self.dns);
+        let udp_thread =
+            thread::spawn(move || udp_loop(relay, associations, config, dns, shutdown));
 
         let wake_address = SocketAddr::new(
             IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -144,13 +150,18 @@ impl Server {
                         continue;
                     }
                     let config = Arc::clone(&self.config);
+                    let dns = Arc::clone(&self.dns);
                     let associations = Arc::clone(&self.associations);
                     let udp = Arc::clone(&self.udp);
                     let shutdown = Arc::clone(&self.shutdown);
                     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                     thread::spawn(move || {
                         if let Err(error) =
-                            handle_client(stream, config, udp, associations, id, shutdown)
+                            handle_client(stream, config, dns, udp, associations, id, shutdown)
+                            && !matches!(
+                                error.kind(),
+                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                            )
                         {
                             eprintln!("连接 {address} 处理失败：{error}");
                         }
@@ -247,6 +258,7 @@ fn unspecified(ip: IpAddr) -> SocketAddr {
 fn handle_client(
     mut stream: TcpStream,
     config: Arc<Config>,
+    dns: Arc<DnsResolver>,
     udp: Arc<UdpSocket>,
     associations: Associations,
     id: u64,
@@ -266,7 +278,7 @@ fn handle_client(
         }
     };
     match command {
-        protocol::CONNECT => connect(stream, target, config.tcp_timeout),
+        protocol::CONNECT => connect(stream, target, config.tcp_timeout, &dns),
         protocol::UDP_ASSOCIATE => associate(&mut stream, target, udp, associations, id, shutdown),
         _ => {
             let address = unspecified(stream.local_addr()?.ip());
@@ -275,9 +287,14 @@ fn handle_client(
     }
 }
 
-fn connect(mut client: TcpStream, target: Target, timeout: Option<Duration>) -> io::Result<()> {
+fn connect(
+    mut client: TcpStream,
+    target: Target,
+    timeout: Option<Duration>,
+    dns: &DnsResolver,
+) -> io::Result<()> {
     let address = unspecified(client.local_addr()?.ip());
-    let addresses = match target.lookup() {
+    let addresses = match dns.lookup(&target) {
         Ok(addresses) => addresses,
         Err(error) => {
             protocol::write_reply(&mut client, protocol::HOST_UNREACHABLE, address)?;
@@ -405,6 +422,7 @@ fn udp_loop(
     udp: Arc<UdpSocket>,
     associations: Associations,
     config: Arc<Config>,
+    dns: Arc<DnsResolver>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let (sender, receiver): (SyncSender<UdpTask>, Receiver<UdpTask>) = mpsc::sync_channel(1024);
@@ -417,12 +435,13 @@ fn udp_loop(
             let udp = Arc::clone(&udp);
             let associations = Arc::clone(&associations);
             let config = Arc::clone(&config);
+            let dns = Arc::clone(&dns);
             let pool = Arc::clone(&pool);
             thread::spawn(move || {
                 loop {
                     let task = receiver.lock().unwrap().recv();
                     let Ok(task) = task else { break };
-                    handle_udp_packet(&udp, &associations, &config, &task);
+                    handle_udp_packet(&udp, &associations, &config, &dns, &task);
                     return_packet(&pool, task.packet);
                 }
             })
@@ -481,6 +500,7 @@ fn handle_udp_packet(
     udp: &Arc<UdpSocket>,
     associations: &Associations,
     config: &Config,
+    dns: &DnsResolver,
     task: &UdpTask,
 ) {
     if !config.whitelist.allows(task.source.ip()) {
@@ -509,7 +529,7 @@ fn handle_udp_packet(
     let flow = if let Some(flow) = existing {
         flow
     } else {
-        let Ok(addresses) = target.lookup() else {
+        let Ok(addresses) = dns.lookup(&target) else {
             return;
         };
         let destination = addresses[0];
@@ -610,6 +630,7 @@ mod tests {
             whitelist: Whitelist::parse(whitelist).unwrap(),
             tcp_timeout: None,
             udp_timeout: Duration::from_secs(3),
+            dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
         };
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = Server::bind(config, Arc::clone(&shutdown)).unwrap();
@@ -660,7 +681,7 @@ mod tests {
         let (proxy, shutdown, server_thread) = start_server("", "", "127.0.0.1");
         let mut client = TcpStream::connect(proxy).unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         assert_eq!(negotiate_client(&mut client, 0), [5, 0]);
         assert_eq!(

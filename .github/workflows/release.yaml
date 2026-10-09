@@ -32,6 +32,16 @@ jobs:
         run: |
           cargo test --locked --all-targets
           cargo build --locked --release --target ${{ matrix.target }}
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v4
+        with:
+          install-only: true
+      - name: Compress and verify binary
+        run: |
+          binary="target/${{ matrix.target }}/release/brume"
+          upx --best "$binary"
+          upx -t "$binary"
+          "$binary" --help | grep -F -- --dns-servers
       - name: Package release asset
         run: |
           tar -czf "brume-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" brume -C "$GITHUB_WORKSPACE" README.md

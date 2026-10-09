@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,6 +11,7 @@ pub struct Config {
     pub whitelist: Whitelist,
     pub tcp_timeout: Option<Duration>,
     pub udp_timeout: Duration,
+    pub dns_servers: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -106,7 +107,7 @@ impl Config {
         while let Some(arg) = args.next() {
             if matches!(arg.as_str(), "-h" | "--help") {
                 println!(
-                    "brume {}\n用法：brume [--config 文件] [-p 端口] [-user 用户名 -pwd 密码] [--whitelist IP或CIDR,...] [--tcp-timeout 秒] [--udp-timeout 秒]",
+                    "brume {}\n用法：brume [--config 文件] [-p 端口] [-user 用户名 -pwd 密码] [--whitelist IP或CIDR,...] [--tcp-timeout 秒] [--udp-timeout 秒] [--dns-servers IP,IP]",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(None);
@@ -130,6 +131,7 @@ impl Config {
                     | "--whitelist"
                     | "--tcp-timeout"
                     | "--udp-timeout"
+                    | "--dns-servers"
             ) {
                 return Err(format!("未知参数：{key}"));
             }
@@ -156,6 +158,7 @@ impl Config {
             whitelist: Whitelist::default(),
             tcp_timeout: None,
             udp_timeout: Duration::from_secs(60),
+            dns_servers: vec!["8.8.8.8:53".parse().unwrap(), "1.1.1.1:53".parse().unwrap()],
         };
         if let Some(path) = config_path {
             config.read_file(Path::new(&path))?;
@@ -185,6 +188,7 @@ impl Config {
                 "whitelist" => "--whitelist",
                 "tcp_timeout" => "--tcp-timeout",
                 "udp_timeout" => "--udp-timeout",
+                "dns_servers" => "--dns-servers",
                 _ => return Err(format!("配置文件第 {} 行存在未知配置项", index + 1)),
             };
             self.apply_value(option, value)
@@ -217,6 +221,35 @@ impl Config {
                     .parse()
                     .map_err(|_| "UDP 超时必须是非负整数秒".to_string())?;
                 self.udp_timeout = Duration::from_secs(seconds);
+            }
+            "--dns-servers" => {
+                let servers: Result<Vec<SocketAddr>, _> = value
+                    .split(',')
+                    .map(|entry| {
+                        let entry = entry.trim();
+                        entry
+                            .parse::<SocketAddr>()
+                            .ok()
+                            .or_else(|| {
+                                entry
+                                    .parse::<IpAddr>()
+                                    .ok()
+                                    .map(|ip| SocketAddr::new(ip, 53))
+                            })
+                            .ok_or(())
+                    })
+                    .collect();
+                let servers =
+                    servers.map_err(|_| "DNS 服务器必须是逗号分隔的 IP 或 IP:端口".to_string())?;
+                if servers.is_empty()
+                    || servers.len() > 8
+                    || servers
+                        .iter()
+                        .any(|server| server.ip().is_unspecified() || server.port() == 0)
+                {
+                    return Err("DNS 服务器数量必须为 1 到 8，且地址和端口必须有效".into());
+                }
+                self.dns_servers = servers;
             }
             _ => return Err(format!("未知参数：{key}")),
         }
@@ -309,7 +342,7 @@ mod tests {
         let path = temporary_config_path();
         fs::write(
             &path,
-            "# 服务配置\r\nport=1080\r\nusername=admin\r\npassword=pass=#word\r\nwhitelist=127.0.0.1\r\ntcp_timeout=5\r\nudp_timeout=15\r\n",
+            "# 服务配置\r\nport=1080\r\nusername=admin\r\npassword=pass=#word\r\nwhitelist=127.0.0.1\r\ntcp_timeout=5\r\nudp_timeout=15\r\ndns_servers=9.9.9.9,1.0.0.1\r\n",
         )
         .unwrap();
         let config = Config::parse([
@@ -327,6 +360,13 @@ mod tests {
         assert!(config.whitelist.allows("127.0.0.1".parse().unwrap()));
         assert_eq!(config.tcp_timeout, Some(Duration::from_secs(5)));
         assert_eq!(config.udp_timeout, Duration::ZERO);
+        assert_eq!(
+            config.dns_servers,
+            vec![
+                "9.9.9.9:53".parse::<SocketAddr>().unwrap(),
+                "1.0.0.1:53".parse().unwrap()
+            ]
+        );
         fs::remove_file(path).unwrap();
     }
 
@@ -342,6 +382,9 @@ mod tests {
         fs::write(&path, "port 1080\n").unwrap();
         assert!(Config::parse([arg.clone()]).is_err());
         assert!(Config::parse([arg.clone(), arg]).is_err());
+        assert!(Config::parse(["--dns-servers=".to_owned()]).is_err());
+        assert!(Config::parse(["--dns-servers=not-an-ip".to_owned()]).is_err());
+        assert!(Config::parse(["--dns-servers=0.0.0.0".to_owned()]).is_err());
         fs::remove_file(path).unwrap();
     }
 }

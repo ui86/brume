@@ -229,6 +229,7 @@ mod tests {
             whitelist: Whitelist::parse("127.0.0.1").unwrap(),
             tcp_timeout: None,
             udp_timeout: Duration::from_secs(3),
+            dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
         };
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = Server::bind(config, Arc::clone(&shutdown)).unwrap();
