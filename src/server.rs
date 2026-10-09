@@ -20,7 +20,71 @@ const MAX_UDP_PACKET_TASKS: usize = 256;
 const MAX_UDP_FLOWS: usize = 1024;
 const MAX_FLOWS_PER_ASSOCIATION: usize = 128;
 
-type Associations = Arc<Mutex<HashMap<u64, Arc<Association>>>>;
+type Associations = Arc<Mutex<AssociationRegistry>>;
+
+#[derive(Default)]
+struct AssociationRegistry {
+    entries: HashMap<u64, Arc<Association>>,
+    endpoints: HashMap<SocketAddr, u64>,
+    pending: HashMap<IpAddr, u64>,
+}
+
+impl AssociationRegistry {
+    fn insert(&mut self, id: u64, association: Arc<Association>) -> bool {
+        let ip = normalize(association.client_ip);
+        if association.requested_port == 0 {
+            if self.pending.contains_key(&ip) {
+                return false;
+            }
+            self.pending.insert(ip, id);
+        } else {
+            let endpoint = SocketAddr::new(ip, association.requested_port);
+            if self.endpoints.contains_key(&endpoint) {
+                return false;
+            }
+            self.endpoints.insert(endpoint, id);
+        }
+        self.entries.insert(id, association);
+        true
+    }
+
+    fn find(&mut self, source: SocketAddr) -> Option<Arc<Association>> {
+        let endpoint = endpoint_key(source);
+        if let Some(id) = self.endpoints.get(&endpoint) {
+            let association = self.entries.get(id)?.clone();
+            return (association.alive.load(Ordering::Relaxed) && association.accepts(source))
+                .then_some(association);
+        }
+        let ip = normalize(source.ip());
+        let id = *self.pending.get(&ip)?;
+        let association = self.entries.get(&id)?.clone();
+        if !association.alive.load(Ordering::Relaxed) || !association.accepts(source) {
+            return None;
+        }
+        self.pending.remove(&ip);
+        self.endpoints.insert(endpoint, id);
+        Some(association)
+    }
+
+    fn remove(&mut self, id: u64) {
+        let Some(association) = self.entries.remove(&id) else {
+            return;
+        };
+        let ip = normalize(association.client_ip);
+        let endpoint = if association.requested_port != 0 {
+            Some(SocketAddr::new(ip, association.requested_port))
+        } else {
+            association.endpoint.lock().unwrap().map(endpoint_key)
+        };
+        if let Some(endpoint) = endpoint {
+            if self.endpoints.get(&endpoint) == Some(&id) {
+                self.endpoints.remove(&endpoint);
+            }
+        } else if self.pending.get(&ip) == Some(&id) {
+            self.pending.remove(&ip);
+        }
+    }
+}
 
 struct Association {
     client_ip: IpAddr,
@@ -32,10 +96,6 @@ struct Association {
 }
 
 impl Association {
-    fn is_bound_to(&self, source: SocketAddr) -> bool {
-        self.endpoint.lock().unwrap().as_ref() == Some(&source)
-    }
-
     fn accepts(&self, source: SocketAddr) -> bool {
         if normalize(source.ip()) != normalize(self.client_ip)
             || (self.requested_port != 0 && self.requested_port != source.port())
@@ -44,7 +104,11 @@ impl Association {
         }
         let mut endpoint = self.endpoint.lock().unwrap();
         match *endpoint {
-            Some(existing) => existing == source,
+            Some(existing) if endpoint_key(existing) == endpoint_key(source) => {
+                *endpoint = Some(source);
+                true
+            }
+            Some(_) => false,
             None => {
                 *endpoint = Some(source);
                 true
@@ -72,6 +136,10 @@ fn normalize(ip: IpAddr) -> IpAddr {
             .unwrap_or(IpAddr::V6(ip)),
         ip => ip,
     }
+}
+
+fn endpoint_key(address: SocketAddr) -> SocketAddr {
+    SocketAddr::new(normalize(address.ip()), address.port())
 }
 
 pub struct Server {
@@ -112,7 +180,7 @@ impl Server {
             dns,
             tcp,
             udp,
-            associations: Arc::new(Mutex::new(HashMap::new())),
+            associations: Arc::new(Mutex::new(AssociationRegistry::default())),
             next_id: AtomicU64::new(1),
             shutdown,
         })
@@ -191,7 +259,7 @@ impl Server {
 
         // 通知所有子任务停止
         self.shutdown.cancel();
-        for association in self.associations.lock().unwrap().values() {
+        for association in self.associations.lock().unwrap().entries.values() {
             association.alive.store(false, Ordering::Relaxed);
             association.stopped.cancel();
         }
@@ -460,14 +528,22 @@ async fn associate(
         stopped: CancellationToken::new(),
         flows: Mutex::new(HashMap::new()),
     });
-    associations
+    if !associations
         .lock()
         .unwrap()
-        .insert(id, Arc::clone(&association));
+        .insert(id, Arc::clone(&association))
+    {
+        let address = unspecified(stream.local_addr()?.ip());
+        protocol::write_reply_async(&mut stream, protocol::SERVER_FAILURE, address).await?;
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "UDP 客户端端点已有控制连接",
+        ));
+    }
     if let Err(error) = protocol::write_reply_async(&mut stream, protocol::SUCCESS, relay).await {
         association.alive.store(false, Ordering::Relaxed);
         association.stopped.cancel();
-        associations.lock().unwrap().remove(&id);
+        associations.lock().unwrap().remove(id);
         return Err(error);
     }
     let mut buffer = [0u8; 1024];
@@ -484,7 +560,7 @@ async fn associate(
     }
     association.alive.store(false, Ordering::Relaxed);
     association.stopped.cancel();
-    associations.lock().unwrap().remove(&id);
+    associations.lock().unwrap().remove(id);
     Ok(())
 }
 
@@ -525,19 +601,7 @@ async fn udp_loop(
             continue;
         };
 
-        let association = {
-            let map = associations.lock().unwrap();
-            map.values()
-                .find(|association| {
-                    association.alive.load(Ordering::Relaxed) && association.is_bound_to(source)
-                })
-                .or_else(|| {
-                    map.values().find(|association| {
-                        association.alive.load(Ordering::Relaxed) && association.accepts(source)
-                    })
-                })
-                .cloned()
-        };
+        let association = associations.lock().unwrap().find(source);
 
         let Some(association) = association else {
             continue;
@@ -794,6 +858,51 @@ mod tests {
         let mut reply = [0; 10];
         stream.read_exact(&mut reply).unwrap();
         reply
+    }
+
+    fn test_association(port: u16) -> Arc<Association> {
+        Arc::new(Association {
+            client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            requested_port: port,
+            endpoint: Mutex::new(None),
+            alive: AtomicBool::new(true),
+            stopped: CancellationToken::new(),
+            flows: Mutex::new(HashMap::new()),
+        })
+    }
+
+    #[test]
+    fn udp_registry_matches_ports_and_rejects_ambiguous_pending_associations() {
+        let mut registry = AssociationRegistry::default();
+        let first = test_association(40001);
+        let second = test_association(40002);
+        let pending = test_association(0);
+        assert!(registry.insert(1, Arc::clone(&first)));
+        assert!(registry.insert(2, Arc::clone(&second)));
+        assert!(registry.insert(3, Arc::clone(&pending)));
+        assert!(!registry.insert(4, test_association(0)));
+        assert!(!registry.insert(5, test_association(40001)));
+        assert!(Arc::ptr_eq(
+            &registry.find("127.0.0.1:40001".parse().unwrap()).unwrap(),
+            &first
+        ));
+        assert!(Arc::ptr_eq(
+            &registry
+                .find("[::ffff:127.0.0.1]:40001".parse().unwrap())
+                .unwrap(),
+            &first
+        ));
+        assert!(Arc::ptr_eq(
+            &registry.find("127.0.0.1:40002".parse().unwrap()).unwrap(),
+            &second
+        ));
+        assert!(Arc::ptr_eq(
+            &registry.find("127.0.0.1:40003".parse().unwrap()).unwrap(),
+            &pending
+        ));
+        registry.remove(3);
+        assert!(registry.find("127.0.0.1:40003".parse().unwrap()).is_none());
+        assert!(registry.insert(4, test_association(0)));
     }
 
     async fn test_udp_flow() -> (
