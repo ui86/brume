@@ -169,7 +169,6 @@ fn advance_udp_address(association: &Association, target: &Target, flow: &Flow) 
 
 pub struct Server {
     config: Arc<Config>,
-    dns: Arc<DnsResolver>,
     tcp: std::net::TcpListener,
     udp: std::net::UdpSocket,
     associations: Associations,
@@ -179,7 +178,6 @@ pub struct Server {
 
 impl Server {
     pub fn bind(config: Config, shutdown: CancellationToken) -> io::Result<Self> {
-        let dns = Arc::new(DnsResolver::new(&config.dns_servers)?);
         let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.port);
         let tcp_socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
         tcp_socket.set_only_v6(false)?;
@@ -202,7 +200,6 @@ impl Server {
         let udp = std::net::UdpSocket::from(udp_socket);
         Ok(Self {
             config: Arc::new(config),
-            dns,
             tcp,
             udp,
             associations: Arc::new(Mutex::new(AssociationRegistry::default())),
@@ -227,6 +224,8 @@ impl Server {
     }
 
     pub async fn run_async(self) -> io::Result<()> {
+        // 在服务运行时内创建解析器，复用已有工作线程
+        let dns = Arc::new(DnsResolver::new(&self.config.dns_servers)?);
         let tcp = tokio::net::TcpListener::from_std(self.tcp)?;
         // 直接消费 self.udp 转为 tokio 套接字，避免 try_clone 产生冗余句柄
         let udp = Arc::new(tokio::net::UdpSocket::from_std(self.udp)?);
@@ -235,10 +234,12 @@ impl Server {
         let associations = Arc::clone(&self.associations);
         let shutdown = self.shutdown.clone();
         let config = Arc::clone(&self.config);
-        let dns = Arc::clone(&self.dns);
+        let udp_dns = Arc::clone(&dns);
 
         let mut udp_task =
-            tokio::spawn(async move { udp_loop(relay, associations, config, dns, shutdown).await });
+            tokio::spawn(
+                async move { udp_loop(relay, associations, config, udp_dns, shutdown).await },
+            );
         let client_slots = Arc::new(Semaphore::new(MAX_TCP_CLIENTS));
 
         let mut result = Ok(());
@@ -266,7 +267,7 @@ impl Server {
                                 continue;
                             };
                             let config = Arc::clone(&self.config);
-                            let dns = Arc::clone(&self.dns);
+                            let dns = Arc::clone(&dns);
                             let associations = Arc::clone(&self.associations);
                             let udp = Arc::clone(&udp);
                             let shutdown = self.shutdown.clone();
