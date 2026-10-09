@@ -44,7 +44,7 @@ jobs:
           "$binary" --help | grep -F -- --dns-servers
       - name: Package release asset
         run: |
-          tar -czf "brume-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" brume -C "$GITHUB_WORKSPACE" README.md
+          tar -czf "brume-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" brume -C "$GITHUB_WORKSPACE" README.md docs
       - name: Upload release asset
         env:
           GH_TOKEN: ${{ github.token }}
