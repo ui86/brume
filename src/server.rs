@@ -212,14 +212,25 @@ impl Server {
         let config = Arc::clone(&self.config);
         let dns = Arc::clone(&self.dns);
 
-        let udp_task =
+        let mut udp_task =
             tokio::spawn(async move { udp_loop(relay, associations, config, dns, shutdown).await });
         let client_slots = Arc::new(Semaphore::new(MAX_TCP_CLIENTS));
 
         let mut result = Ok(());
+        let mut udp_result = None;
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
+                outcome = &mut udp_task => {
+                    udp_result = Some(match outcome {
+                        Ok(Ok(())) if !self.shutdown.is_cancelled() => {
+                            Err(io::Error::other("UDP 任务意外退出"))
+                        }
+                        Ok(result) => result,
+                        Err(error) => Err(io::Error::other(error)),
+                    });
+                    break;
+                }
                 accept_res = tcp.accept() => {
                     match accept_res {
                         Ok((stream, address)) => {
@@ -263,9 +274,12 @@ impl Server {
             association.alive.store(false, Ordering::Relaxed);
             association.stopped.cancel();
         }
-        let udp_result = udp_task
-            .await
-            .map_err(|_| io::Error::other("UDP 任务异常退出"))?;
+        let udp_result = match udp_result {
+            Some(result) => result,
+            None => udp_task
+                .await
+                .map_err(|_| io::Error::other("UDP 任务异常退出"))?,
+        };
         result.and(udp_result)
     }
 }
