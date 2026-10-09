@@ -10,13 +10,13 @@ pub const CONNECTION_REFUSED: u8 = 5;
 pub const COMMAND_UNSUPPORTED: u8 = 7;
 pub const ADDRESS_UNSUPPORTED: u8 = 8;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Host {
     Ip(IpAddr),
     Domain(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Target {
     pub host: Host,
     pub port: u16,
@@ -169,12 +169,42 @@ pub fn encode_datagram(address: SocketAddr, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
+pub(crate) fn datagram_header_len(address: SocketAddr) -> usize {
+    if address.is_ipv4() { 10 } else { 22 }
+}
+
+pub(crate) fn write_datagram_header(bytes: &mut [u8], address: SocketAddr) {
+    bytes[0..3].copy_from_slice(&[0, 0, 0]);
+    match address.ip() {
+        IpAddr::V4(ip) => {
+            bytes[3] = 1;
+            bytes[4..8].copy_from_slice(&ip.octets());
+            bytes[8..10].copy_from_slice(&address.port().to_be_bytes());
+        }
+        IpAddr::V6(ip) => {
+            bytes[3] = 4;
+            bytes[4..20].copy_from_slice(&ip.octets());
+            bytes[20..22].copy_from_slice(&address.port().to_be_bytes());
+        }
+    }
+}
+
 pub fn encode_datagram_to(target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(4 + 258 + payload.len());
-    bytes.extend_from_slice(&[0, 0, 0]);
-    encode_target(&mut bytes, target)?;
-    bytes.extend_from_slice(payload);
+    append_datagram_to(&mut bytes, target, payload)?;
     Ok(bytes)
+}
+
+pub(crate) fn append_datagram_to(
+    bytes: &mut Vec<u8>,
+    target: &Target,
+    payload: &[u8],
+) -> io::Result<()> {
+    bytes.clear();
+    bytes.extend_from_slice(&[0, 0, 0]);
+    encode_target(bytes, target)?;
+    bytes.extend_from_slice(payload);
+    Ok(())
 }
 
 #[cfg(test)]

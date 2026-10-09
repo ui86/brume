@@ -7,7 +7,7 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const UDP_BUFFER_SIZE: usize = 65_535;
+const UDP_POOL_CAPACITY: usize = 64;
 
 type Associations = Arc<Mutex<HashMap<u64, Arc<Association>>>>;
 
@@ -23,7 +24,7 @@ struct Association {
     requested_port: u16,
     endpoint: Mutex<Option<SocketAddr>>,
     alive: AtomicBool,
-    flows: Mutex<HashMap<SocketAddr, Arc<Flow>>>,
+    flows: Mutex<HashMap<Target, Arc<Flow>>>,
 }
 
 impl Association {
@@ -55,8 +56,11 @@ struct Flow {
 
 struct UdpTask {
     packet: Vec<u8>,
+    length: usize,
     source: SocketAddr,
 }
+
+type PacketPool = Arc<Mutex<Vec<Vec<u8>>>>;
 
 fn normalize(ip: IpAddr) -> IpAddr {
     match ip {
@@ -91,7 +95,6 @@ impl Server {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), tcp.local_addr()?.port());
         udp_socket.bind(&udp_address.into())?;
         let udp = Arc::new(UdpSocket::from(udp_socket));
-        tcp.set_nonblocking(true)?;
         udp.set_read_timeout(Some(POLL_INTERVAL))?;
         Ok(Self {
             config: Arc::new(config),
@@ -114,10 +117,25 @@ impl Server {
         let config = Arc::clone(&self.config);
         let udp_thread = thread::spawn(move || udp_loop(relay, associations, config, shutdown));
 
+        let wake_address = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            self.tcp.local_addr()?.port(),
+        );
+        let wake_flag = Arc::clone(&self.shutdown);
+        let wake_thread = thread::spawn(move || {
+            while !wake_flag.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = TcpStream::connect_timeout(&wake_address, Duration::from_secs(1));
+        });
+
         let mut result = Ok(());
         while !self.shutdown.load(Ordering::Relaxed) {
             match self.tcp.accept() {
                 Ok((stream, address)) => {
+                    if self.shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if !self.config.whitelist.allows(address.ip()) {
                         continue;
                     }
@@ -138,9 +156,6 @@ impl Server {
                         }
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(POLL_INTERVAL)
-                }
                 Err(error) => {
                     result = Err(error);
                     break;
@@ -148,6 +163,7 @@ impl Server {
             }
         }
         self.shutdown.store(true, Ordering::Relaxed);
+        let _ = wake_thread.join();
         for association in self.associations.lock().unwrap().values() {
             association.alive.store(false, Ordering::Relaxed);
         }
@@ -393,6 +409,7 @@ fn udp_loop(
 ) -> io::Result<()> {
     let (sender, receiver): (SyncSender<UdpTask>, Receiver<UdpTask>) = mpsc::sync_channel(1024);
     let receiver = Arc::new(Mutex::new(receiver));
+    let pool: PacketPool = Arc::new(Mutex::new(Vec::new()));
     let worker_count = thread::available_parallelism().map_or(4, |count| count.get().clamp(4, 16));
     let workers: Vec<_> = (0..worker_count)
         .map(|_| {
@@ -400,19 +417,25 @@ fn udp_loop(
             let udp = Arc::clone(&udp);
             let associations = Arc::clone(&associations);
             let config = Arc::clone(&config);
+            let pool = Arc::clone(&pool);
             thread::spawn(move || {
                 loop {
                     let task = receiver.lock().unwrap().recv();
                     let Ok(task) = task else { break };
-                    handle_udp_packet(&udp, &associations, &config, task);
+                    handle_udp_packet(&udp, &associations, &config, &task);
+                    return_packet(&pool, task.packet);
                 }
             })
         })
         .collect();
-    let mut buffer = vec![0; UDP_BUFFER_SIZE];
     let mut result = Ok(());
     while !shutdown.load(Ordering::Relaxed) {
-        let (length, source) = match udp.recv_from(&mut buffer) {
+        let mut packet = pool
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| vec![0; UDP_BUFFER_SIZE]);
+        let (length, source) = match udp.recv_from(&mut packet) {
             Ok(packet) => packet,
             Err(error)
                 if matches!(
@@ -420,18 +443,25 @@ fn udp_loop(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
+                return_packet(&pool, packet);
                 continue;
             }
             Err(error) => {
+                return_packet(&pool, packet);
                 shutdown.store(true, Ordering::Relaxed);
                 result = Err(error);
                 break;
             }
         };
-        let _ = sender.try_send(UdpTask {
-            packet: buffer[..length].to_vec(),
-            source,
-        });
+        if let Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) =
+            sender.try_send(UdpTask {
+                packet,
+                length,
+                source,
+            })
+        {
+            return_packet(&pool, task.packet);
+        }
     }
     drop(sender);
     for worker in workers {
@@ -440,16 +470,23 @@ fn udp_loop(
     result
 }
 
+fn return_packet(pool: &PacketPool, packet: Vec<u8>) {
+    let mut buffers = pool.lock().unwrap();
+    if buffers.len() < UDP_POOL_CAPACITY {
+        buffers.push(packet);
+    }
+}
+
 fn handle_udp_packet(
     udp: &Arc<UdpSocket>,
     associations: &Associations,
     config: &Config,
-    task: UdpTask,
+    task: &UdpTask,
 ) {
     if !config.whitelist.allows(task.source.ip()) {
         return;
     }
-    let Ok((target, payload)) = protocol::parse_datagram(&task.packet) else {
+    let Ok((target, payload)) = protocol::parse_datagram(&task.packet[..task.length]) else {
         return;
     };
     let association = {
@@ -468,37 +505,41 @@ fn handle_udp_packet(
     let Some(association) = association else {
         return;
     };
-    let Ok(addresses) = target.lookup() else {
-        return;
-    };
-    let destination = addresses[0];
-    let flow = {
+    let existing = association.flows.lock().unwrap().get(&target).cloned();
+    let flow = if let Some(flow) = existing {
+        flow
+    } else {
+        let Ok(addresses) = target.lookup() else {
+            return;
+        };
+        let destination = addresses[0];
+        let Ok(socket) = UdpSocket::bind(unspecified(destination.ip())) else {
+            return;
+        };
+        if socket.connect(destination).is_err()
+            || socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .is_err()
+        {
+            return;
+        }
+        let candidate = Arc::new(Flow {
+            socket,
+            last_activity: Mutex::new(Instant::now()),
+        });
         let mut flows = association.flows.lock().unwrap();
-        if let Some(flow) = flows.get(&destination) {
+        if let Some(flow) = flows.get(&target) {
             Arc::clone(flow)
         } else {
-            let bind = unspecified(destination.ip());
-            let Ok(socket) = UdpSocket::bind(bind) else {
-                return;
-            };
-            if socket.connect(destination).is_err()
-                || socket
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .is_err()
-            {
-                return;
-            }
-            let flow = Arc::new(Flow {
-                socket,
-                last_activity: Mutex::new(Instant::now()),
-            });
-            flows.insert(destination, Arc::clone(&flow));
+            flows.insert(target.clone(), Arc::clone(&candidate));
             let association = Arc::clone(&association);
             let relay = Arc::clone(udp);
-            let worker = Arc::clone(&flow);
+            let worker = Arc::clone(&candidate);
             let timeout = config.udp_timeout;
-            thread::spawn(move || receive_remote(worker, relay, association, destination, timeout));
-            flow
+            thread::spawn(move || {
+                receive_remote(worker, relay, association, target, destination, timeout)
+            });
+            candidate
         }
     };
     *flow.last_activity.lock().unwrap() = Instant::now();
@@ -509,20 +550,23 @@ fn receive_remote(
     flow: Arc<Flow>,
     relay: Arc<UdpSocket>,
     association: Arc<Association>,
+    target: Target,
     destination: SocketAddr,
     timeout: Duration,
 ) {
-    let mut buffer = vec![0; UDP_BUFFER_SIZE - 22];
+    let mut buffer = vec![0; UDP_BUFFER_SIZE];
     while association.alive.load(Ordering::Relaxed) {
-        match flow.socket.recv(&mut buffer) {
+        match flow.socket.recv(&mut buffer[22..]) {
             Ok(length) => {
                 if !association.alive.load(Ordering::Relaxed) {
                     break;
                 }
                 *flow.last_activity.lock().unwrap() = Instant::now();
                 if let Some(source) = *association.endpoint.lock().unwrap() {
-                    let packet = protocol::encode_datagram(destination, &buffer[..length]);
-                    let _ = relay.send_to(&packet, source);
+                    let header_length = protocol::datagram_header_len(destination);
+                    let start = 22 - header_length;
+                    protocol::write_datagram_header(&mut buffer[start..22], destination);
+                    let _ = relay.send_to(&buffer[start..22 + length], source);
                 }
             }
             Err(error)
@@ -538,10 +582,10 @@ fn receive_remote(
     }
     let mut flows = association.flows.lock().unwrap();
     if flows
-        .get(&destination)
+        .get(&target)
         .is_some_and(|current| Arc::ptr_eq(current, &flow))
     {
-        flows.remove(&destination);
+        flows.remove(&target);
     }
 }
 

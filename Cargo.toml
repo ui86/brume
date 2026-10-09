@@ -8,7 +8,15 @@ description = "轻量级 SOCKS5 代理服务器"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 socket2 = "0.6.5"
 
+[features]
+performance-bench = []
+
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+[[bench]]
+name = "benchmarks"
+harness = false
+required-features = ["performance-bench"]

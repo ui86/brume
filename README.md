@@ -76,11 +76,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
+cargo bench --features performance-bench --bench benchmarks --locked
 ```
 
-[重构分析与验证范围](docs/benchmark-comparison.md)
+基准测试使用 Release 优化配置，对协议、白名单和本机 TCP/UDP 代理进行测量；每项输出五轮结果的中位数。本机结果和适用范围见[重构分析与性能基准](docs/benchmark-comparison.md)。
 
 ## 许可
 

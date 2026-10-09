@@ -1,6 +1,7 @@
 use crate::protocol::{self, Host, Target};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::Mutex;
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -19,6 +20,8 @@ pub struct UdpAssociation {
     socket: UdpSocket,
     target: Target,
     relay: SocketAddr,
+    send_buffer: Mutex<Vec<u8>>,
+    recv_buffer: Mutex<Vec<u8>>,
 }
 
 impl Client {
@@ -148,13 +151,16 @@ impl Client {
             socket,
             target,
             relay,
+            send_buffer: Mutex::new(Vec::new()),
+            recv_buffer: Mutex::new(vec![0; UDP_BUFFER_SIZE]),
         })
     }
 }
 
 impl UdpAssociation {
     pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
-        let packet = protocol::encode_datagram_to(&self.target, payload)?;
+        let mut packet = self.send_buffer.lock().unwrap();
+        protocol::append_datagram_to(&mut packet, &self.target, payload)?;
         let length = self.socket.send(&packet)?;
         if length != packet.len() {
             return Err(io::Error::new(
@@ -166,7 +172,7 @@ impl UdpAssociation {
     }
 
     pub fn recv(&self, payload: &mut [u8]) -> io::Result<(usize, Target)> {
-        let mut buffer = vec![0; UDP_BUFFER_SIZE];
+        let mut buffer = self.recv_buffer.lock().unwrap();
         let length = self.socket.recv(&mut buffer)?;
         let (target, data) = protocol::parse_datagram(&buffer[..length])?;
         if data.len() > payload.len() {
@@ -260,20 +266,28 @@ mod tests {
     fn client_associates_and_exchanges_udp() {
         let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
         echo.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let target = Target::from(echo.local_addr().unwrap());
+        let destination = echo.local_addr().unwrap();
+        let target = Target {
+            host: Host::Domain("127.0.0.1".into()),
+            port: destination.port(),
+        };
         let echo_thread = thread::spawn(move || {
             let mut payload = [0; 100];
-            let (length, source) = echo.recv_from(&mut payload).unwrap();
-            echo.send_to(&payload[..length], source).unwrap();
+            for _ in 0..2 {
+                let (length, source) = echo.recv_from(&mut payload).unwrap();
+                echo.send_to(&payload[..length], source).unwrap();
+            }
         });
         let (address, shutdown, server_thread) = start_server();
         let client = Client::new(&address, "admin", "secret").unwrap();
         let association = client.associate(target.clone()).unwrap();
-        assert_eq!(association.send(b"hello").unwrap(), 5);
-        let mut payload = [0; 100];
-        let (length, source) = association.recv(&mut payload).unwrap();
-        assert_eq!(&payload[..length], b"hello");
-        assert_eq!(source, target);
+        for _ in 0..2 {
+            assert_eq!(association.send(b"hello").unwrap(), 5);
+            let mut payload = [0; 100];
+            let (length, source) = association.recv(&mut payload).unwrap();
+            assert_eq!(&payload[..length], b"hello");
+            assert_eq!(source, Target::from(destination));
+        }
         echo_thread.join().unwrap();
         drop(association);
         shutdown.store(true, Ordering::Relaxed);
