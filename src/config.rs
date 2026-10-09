@@ -1,4 +1,6 @@
+use std::fs;
 use std::net::IpAddr;
+use std::path::Path;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -98,19 +100,13 @@ fn prefix_matches(network: IpAddr, address: IpAddr, bits: u8) -> bool {
 
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Self>, String> {
-        let mut config = Self {
-            port: 1080,
-            username: String::new(),
-            password: String::new(),
-            whitelist: Whitelist::default(),
-            tcp_timeout: None,
-            udp_timeout: Duration::from_secs(60),
-        };
         let mut args = args.into_iter();
+        let mut config_path = None;
+        let mut overrides = Vec::new();
         while let Some(arg) = args.next() {
             if matches!(arg.as_str(), "-h" | "--help") {
                 println!(
-                    "brume {}\n用法：brume [-p 端口] [-user 用户名 -pwd 密码] [--whitelist IP或CIDR,...] [--tcp-timeout 秒] [--udp-timeout 秒]",
+                    "brume {}\n用法：brume [--config 文件] [-p 端口] [-user 用户名 -pwd 密码] [--whitelist IP或CIDR,...] [--tcp-timeout 秒] [--udp-timeout 秒]",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(None);
@@ -122,44 +118,119 @@ impl Config {
             let (key, inline) = arg
                 .split_once('=')
                 .map_or((arg.as_str(), None), |(key, value)| (key, Some(value)));
+            if !matches!(
+                key,
+                "--config"
+                    | "-p"
+                    | "--port"
+                    | "-user"
+                    | "--user"
+                    | "-pwd"
+                    | "--pwd"
+                    | "--whitelist"
+                    | "--tcp-timeout"
+                    | "--udp-timeout"
+            ) {
+                return Err(format!("未知参数：{key}"));
+            }
             let value = match inline {
                 Some(value) => value.to_owned(),
                 None => args.next().ok_or_else(|| format!("参数 {key} 缺少值"))?,
             };
-            match key {
-                "-p" | "--port" => {
-                    config.port = value
-                        .parse()
-                        .map_err(|_| "端口必须在 1 到 65535 之间".to_string())?;
-                    if config.port == 0 {
-                        return Err("端口必须在 1 到 65535 之间".into());
-                    }
+            if key == "--config" {
+                if value.is_empty() {
+                    return Err("配置文件路径不能为空".into());
                 }
-                "-user" | "--user" => config.username = value,
-                "-pwd" | "--pwd" => config.password = value,
-                "--whitelist" => config.whitelist = Whitelist::parse(&value)?,
-                "--tcp-timeout" => {
-                    let seconds: u64 = value
-                        .parse()
-                        .map_err(|_| "TCP 超时必须是非负整数秒".to_string())?;
-                    config.tcp_timeout = (seconds > 0).then(|| Duration::from_secs(seconds));
+                if config_path.replace(value).is_some() {
+                    return Err("只能指定一个配置文件".into());
                 }
-                "--udp-timeout" => {
-                    let seconds: u64 = value
-                        .parse()
-                        .map_err(|_| "UDP 超时必须是非负整数秒".to_string())?;
-                    config.udp_timeout = Duration::from_secs(seconds);
-                }
-                _ => return Err(format!("未知参数：{key}")),
+            } else {
+                overrides.push((key.to_owned(), value));
             }
         }
-        if config.username.is_empty() != config.password.is_empty() {
+
+        let mut config = Self {
+            port: 1080,
+            username: String::new(),
+            password: String::new(),
+            whitelist: Whitelist::default(),
+            tcp_timeout: None,
+            udp_timeout: Duration::from_secs(60),
+        };
+        if let Some(path) = config_path {
+            config.read_file(Path::new(&path))?;
+        }
+        for (key, value) in overrides {
+            config.apply_value(&key, &value)?;
+        }
+        config.validate()?;
+        Ok(Some(config))
+    }
+
+    fn read_file(&mut self, path: &Path) -> Result<(), String> {
+        let contents = fs::read_to_string(path)
+            .map_err(|error| format!("读取配置文件 {} 失败：{error}", path.display()))?;
+        for (index, line) in contents.lines().enumerate() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("配置文件第 {} 行缺少等号", index + 1))?;
+            let option = match key.trim() {
+                "port" => "--port",
+                "username" => "--user",
+                "password" => "--pwd",
+                "whitelist" => "--whitelist",
+                "tcp_timeout" => "--tcp-timeout",
+                "udp_timeout" => "--udp-timeout",
+                _ => return Err(format!("配置文件第 {} 行存在未知配置项", index + 1)),
+            };
+            self.apply_value(option, value)
+                .map_err(|error| format!("配置文件第 {} 行：{error}", index + 1))?;
+        }
+        Ok(())
+    }
+
+    fn apply_value(&mut self, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "-p" | "--port" => {
+                self.port = value
+                    .parse()
+                    .map_err(|_| "端口必须在 1 到 65535 之间".to_string())?;
+                if self.port == 0 {
+                    return Err("端口必须在 1 到 65535 之间".into());
+                }
+            }
+            "-user" | "--user" => self.username = value.to_owned(),
+            "-pwd" | "--pwd" => self.password = value.to_owned(),
+            "--whitelist" => self.whitelist = Whitelist::parse(value)?,
+            "--tcp-timeout" => {
+                let seconds: u64 = value
+                    .parse()
+                    .map_err(|_| "TCP 超时必须是非负整数秒".to_string())?;
+                self.tcp_timeout = (seconds > 0).then(|| Duration::from_secs(seconds));
+            }
+            "--udp-timeout" => {
+                let seconds: u64 = value
+                    .parse()
+                    .map_err(|_| "UDP 超时必须是非负整数秒".to_string())?;
+                self.udp_timeout = Duration::from_secs(seconds);
+            }
+            _ => return Err(format!("未知参数：{key}")),
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.username.is_empty() != self.password.is_empty() {
             return Err("用户名和密码必须同时设置".into());
         }
-        if config.username.len() > 255 || config.password.len() > 255 {
+        if self.username.len() > 255 || self.password.len() > 255 {
             return Err("用户名和密码不能超过 255 字节".into());
         }
-        Ok(Some(config))
+        Ok(())
     }
 }
 
@@ -167,6 +238,16 @@ impl Config {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temporary_config_path() -> std::path::PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "brume-config-{}-{}.conf",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn whitelist_matches_addresses_and_networks() {
@@ -221,5 +302,46 @@ mod tests {
         assert_eq!(config.port, 8080);
         assert!(!config.whitelist.is_empty());
         assert!(Config::parse(["-user", "admin"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn loads_config_file_and_applies_command_line_overrides() {
+        let path = temporary_config_path();
+        fs::write(
+            &path,
+            "# 服务配置\r\nport=1080\r\nusername=admin\r\npassword=pass=#word\r\nwhitelist=127.0.0.1\r\ntcp_timeout=5\r\nudp_timeout=15\r\n",
+        )
+        .unwrap();
+        let config = Config::parse([
+            "--port".to_owned(),
+            "26547".to_owned(),
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--udp-timeout=0".to_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.port, 26547);
+        assert_eq!(config.username, "admin");
+        assert_eq!(config.password, "pass=#word");
+        assert!(config.whitelist.allows("127.0.0.1".parse().unwrap()));
+        assert_eq!(config.tcp_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(config.udp_timeout, Duration::ZERO);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_config_files() {
+        let path = temporary_config_path();
+        let arg = format!("--config={}", path.display());
+        assert!(Config::parse([arg.clone()]).is_err());
+        fs::write(&path, "password=secret\n").unwrap();
+        assert!(Config::parse([arg.clone()]).is_err());
+        fs::write(&path, "unknown=value\n").unwrap();
+        assert!(Config::parse([arg.clone()]).is_err());
+        fs::write(&path, "port 1080\n").unwrap();
+        assert!(Config::parse([arg.clone()]).is_err());
+        assert!(Config::parse([arg.clone(), arg]).is_err());
+        fs::remove_file(path).unwrap();
     }
 }

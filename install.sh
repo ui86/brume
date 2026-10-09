@@ -11,8 +11,12 @@ DEFAULT_PORT=1080
 DEFAULT_USER=""
 DEFAULT_PASSWORD=""
 DEFAULT_WHITELIST=""
+DEFAULT_TCP_TIMEOUT=0
+DEFAULT_UDP_TIMEOUT=60
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="brume"
+CONFIG_DIR="/etc/brume"
+CONFIG_FILE="${CONFIG_DIR}/brume.conf"
 GITHUB_REPO="ui86/brume"
 
 # iptables chain 名称（用于标识 Brume 添加的规则）
@@ -31,6 +35,60 @@ execute_privileged() {
     else
         "$@"
     fi
+}
+
+# 将完整配置原子写入仅 root 可读的文件
+write_config_file() {
+    local value temp_file
+    for value in "$@"; do
+        if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+            echo "配置值不能包含换行符" >&2
+            return 1
+        fi
+    done
+    install -d -m 700 "${CONFIG_DIR}" || return 1
+    chmod 700 "${CONFIG_DIR}" || return 1
+    temp_file=$(mktemp "${CONFIG_DIR}/.brume.conf.XXXXXX") || return 1
+    if ! {
+        printf 'port=%s\n' "$1"
+        printf 'username=%s\n' "$2"
+        printf 'password=%s\n' "$3"
+        printf 'whitelist=%s\n' "$4"
+        printf 'tcp_timeout=%s\n' "$5"
+        printf 'udp_timeout=%s\n' "$6"
+    } > "${temp_file}"; then
+        rm -f "${temp_file}"
+        return 1
+    fi
+    chmod 600 "${temp_file}" || { rm -f "${temp_file}"; return 1; }
+    mv -f "${temp_file}" "${CONFIG_FILE}" || { rm -f "${temp_file}"; return 1; }
+}
+
+# 按字面值读取配置，避免将密码作为 Shell 代码执行
+load_config_file() {
+    local line key value content
+    while IFS= read -r line || [ -n "${line}" ]; do
+        line=${line%$'\r'}
+        content=${line#"${line%%[![:space:]]*}"}
+        case "${content}" in
+            ''|\#*) continue ;;
+            *=*) ;;
+            *) echo "配置文件格式无效" >&2; return 1 ;;
+        esac
+        key=${line%%=*}
+        key=${key#"${key%%[![:space:]]*}"}
+        key=${key%"${key##*[![:space:]]}"}
+        value=${line#*=}
+        case "${key}" in
+            port) port=${value} ;;
+            username) user=${value} ;;
+            password) password=${value} ;;
+            whitelist) whitelist=${value} ;;
+            tcp_timeout) tcp_timeout=${value} ;;
+            udp_timeout) udp_timeout=${value} ;;
+            *) echo "配置文件包含未知配置项" >&2; return 1 ;;
+        esac
+    done < "${CONFIG_FILE}"
 }
 
 # 颜色定义
@@ -53,6 +111,7 @@ show_help() {
     echo ""
     echo "支持的服务管理器: systemd / OpenRC / SysVinit"
     echo "支持的防火墙: firewalld / ufw / nftables / iptables"
+    echo "服务配置文件: ${CONFIG_FILE}"
     echo ""
     echo "注意：此脚本需要以root用户或使用sudo运行"
     exit 0
@@ -78,22 +137,9 @@ detect_init_system() {
 
 # 创建 systemd 服务文件
 create_systemd_service() {
-    local port=$1
-    local user=$2
-    local password=$3
-    local whitelist=$4
     local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
 
     echo "正在创建 systemd 服务文件..."
-
-    # 构建命令参数
-    local cmd_args="-p ${port}"
-    if [ -n "${user}" ] && [ -n "${password}" ]; then
-        cmd_args="${cmd_args} -user ${user} -pwd ${password}"
-    fi
-    if [ -n "${whitelist}" ]; then
-        cmd_args="${cmd_args} --whitelist ${whitelist}"
-    fi
 
     # 创建服务文件
     if ! execute_privileged tee "${service_file}" > /dev/null <<EOF
@@ -103,7 +149,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/brume ${cmd_args}
+ExecStart=${INSTALL_DIR}/brume --config ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=5s
 
@@ -123,22 +169,9 @@ EOF
 
 # 创建 OpenRC 服务脚本
 create_openrc_service() {
-    local port=$1
-    local user=$2
-    local password=$3
-    local whitelist=$4
     local service_file="/etc/init.d/${SERVICE_NAME}"
 
     echo "正在创建 OpenRC 服务脚本..."
-
-    # 构建命令参数
-    local cmd_args="-p ${port}"
-    if [ -n "${user}" ] && [ -n "${password}" ]; then
-        cmd_args="${cmd_args} -user ${user} -pwd ${password}"
-    fi
-    if [ -n "${whitelist}" ]; then
-        cmd_args="${cmd_args} --whitelist ${whitelist}"
-    fi
 
     if ! execute_privileged tee "${service_file}" > /dev/null <<EOF
 #!/sbin/openrc-run
@@ -146,7 +179,7 @@ create_openrc_service() {
 name="brume"
 description="Brume Proxy Server"
 command="${INSTALL_DIR}/brume"
-command_args="${cmd_args}"
+command_args="--config ${CONFIG_FILE}"
 command_background=true
 pidfile="/run/\${RC_SVCNAME}.pid"
 
@@ -168,22 +201,9 @@ EOF
 
 # 创建 SysVinit 服务脚本
 create_sysvinit_service() {
-    local port=$1
-    local user=$2
-    local password=$3
-    local whitelist=$4
     local service_file="/etc/init.d/${SERVICE_NAME}"
 
     echo "正在创建 SysVinit 服务脚本..."
-
-    # 构建命令参数
-    local cmd_args="-p ${port}"
-    if [ -n "${user}" ] && [ -n "${password}" ]; then
-        cmd_args="${cmd_args} -user ${user} -pwd ${password}"
-    fi
-    if [ -n "${whitelist}" ]; then
-        cmd_args="${cmd_args} --whitelist ${whitelist}"
-    fi
 
     if ! execute_privileged tee "${service_file}" > /dev/null <<'OUTER_EOF'
 #!/bin/bash
@@ -198,7 +218,7 @@ create_sysvinit_service() {
 ### END INIT INFO
 
 DAEMON="PLACEHOLDER_INSTALL_DIR/brume"
-DAEMON_ARGS="PLACEHOLDER_CMD_ARGS"
+DAEMON_ARGS="--config PLACEHOLDER_CONFIG_FILE"
 PIDFILE="/var/run/brume.pid"
 NAME="brume"
 
@@ -257,7 +277,7 @@ OUTER_EOF
 
     # 替换占位符为实际值
     execute_privileged sed -i "s|PLACEHOLDER_INSTALL_DIR|${INSTALL_DIR}|g" "${service_file}"
-    execute_privileged sed -i "s|PLACEHOLDER_CMD_ARGS|${cmd_args}|g" "${service_file}"
+    execute_privileged sed -i "s|PLACEHOLDER_CONFIG_FILE|${CONFIG_FILE}|g" "${service_file}"
 
     execute_privileged chmod +x "${service_file}"
 
@@ -275,20 +295,16 @@ OUTER_EOF
 # 根据检测到的 init 系统创建服务
 create_service() {
     local init_system=$1
-    local port=$2
-    local user=$3
-    local password=$4
-    local whitelist=$5
 
     case "${init_system}" in
         systemd)
-            create_systemd_service "${port}" "${user}" "${password}" "${whitelist}"
+            create_systemd_service
             ;;
         openrc)
-            create_openrc_service "${port}" "${user}" "${password}" "${whitelist}"
+            create_openrc_service
             ;;
         sysvinit)
-            create_sysvinit_service "${port}" "${user}" "${password}" "${whitelist}"
+            create_sysvinit_service
             ;;
         *)
             echo -e "${RED}不支持的服务管理器: ${init_system}${RESET}"
@@ -848,86 +864,73 @@ get_latest_version() {
     echo "$latest_version"
 }
 
-# 下载并安装二进制文件
-download_and_install() {
+# 下载并检查二进制文件，暂不替换正在运行的程序
+binary_supports_config() {
+    local help
+    help=$("$1" --help 2>&1) || return 1
+    [[ "${help}" == *--config* ]]
+}
+
+prepare_binary() {
     local version=$1
     local arch=$2
-    # shellcheck disable=SC2155
-    local temp_dir=$(mktemp -d)
+    prepared_dir=$(mktemp -d) || exit 1
     local download_url="https://github.com/${GITHUB_REPO}/releases/download/${version}/brume-${version}-linux-${arch}.tar.gz"
-    local tar_file="${temp_dir}/brume-${version}-linux-${arch}.tar.gz"
+    local tar_file="${prepared_dir}/brume-${version}-linux-${arch}.tar.gz"
 
     echo "正在下载 ${download_url}..."
-    if ! curl -L -o "${tar_file}" "${download_url}"; then
+    if ! curl -fL -o "${tar_file}" "${download_url}"; then
         echo -e "${RED}下载失败，请检查网络连接或版本是否存在${RESET}"
-        rm -rf "${temp_dir}"
+        rm -rf "${prepared_dir}"
         exit 1
     fi
 
     echo "解压安装包..."
-    if ! tar -xzf "${tar_file}" -C "${temp_dir}"; then
+    if ! tar -xzf "${tar_file}" -C "${prepared_dir}"; then
         echo -e "${RED}解压失败${RESET}"
-        rm -rf "${temp_dir}"
+        rm -rf "${prepared_dir}"
         exit 1
     fi
 
+    # 拒绝不支持配置文件的旧版程序，避免回退到命令行传递密码
+    if ! binary_supports_config "${prepared_dir}/brume"; then
+        echo -e "${RED}该版本不支持配置文件，请选择包含 --config 功能的新版本${RESET}"
+        rm -rf "${prepared_dir}"
+        exit 1
+    fi
+}
+
+# 安装已经验证过的二进制文件
+install_prepared_binary() {
     echo "安装到 ${INSTALL_DIR}..."
-    if ! execute_privileged mv "${temp_dir}/brume" "${INSTALL_DIR}"; then
+    if ! execute_privileged mv "${prepared_dir}/brume" "${INSTALL_DIR}"; then
         echo -e "${RED}安装失败，请检查权限${RESET}"
-        rm -rf "${temp_dir}"
+        rm -rf "${prepared_dir}"
         exit 1
     fi
 
     execute_privileged chmod +x "${INSTALL_DIR}/brume"
-    rm -rf "${temp_dir}"
+    rm -rf "${prepared_dir}"
+    prepared_dir=""
     echo -e "${GREEN}安装成功${RESET}"
+}
+
+download_and_install() {
+    prepare_binary "$1" "$2"
+    install_prepared_binary
 }
 
 # 从当前服务配置中获取端口号
 get_current_port() {
-    local port=""
-    local init_system
-    init_system=$(detect_init_system)
-
-    case "${init_system}" in
-        systemd)
-            local exec_start
-            exec_start=$(execute_privileged grep '^ExecStart=' "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null | head -n1)
-            port=$(echo "${exec_start}" | grep -oP '(?<=-p\s)\d+')
-            ;;
-        openrc|sysvinit)
-            local cmd_line
-            cmd_line=$(execute_privileged grep -E '(command_args|DAEMON_ARGS)' "/etc/init.d/${SERVICE_NAME}" 2>/dev/null | head -n1)
-            port=$(echo "${cmd_line}" | grep -oP '(?<=-p\s)\d+')
-            ;;
-    esac
-
-    # 如果解析失败，使用默认端口
-    if [ -z "${port}" ]; then
-        port="${DEFAULT_PORT}"
-    fi
+    local port user password whitelist tcp_timeout udp_timeout uses_config_file
+    get_current_config_auto "$(detect_init_system)" || return 1
     echo "${port}"
 }
 
 # 从当前服务配置中获取白名单
 get_current_whitelist() {
-    local whitelist=""
-    local init_system
-    init_system=$(detect_init_system)
-
-    case "${init_system}" in
-        systemd)
-            local exec_start
-            exec_start=$(execute_privileged grep '^ExecStart=' "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null | head -n1)
-            whitelist=$(echo "${exec_start}" | grep -oP '(?<=--whitelist\s)\S+')
-            ;;
-        openrc|sysvinit)
-            local cmd_line
-            cmd_line=$(execute_privileged grep -E '(command_args|DAEMON_ARGS)' "/etc/init.d/${SERVICE_NAME}" 2>/dev/null | head -n1)
-            whitelist=$(echo "${cmd_line}" | grep -oP '(?<=--whitelist\s)\S+')
-            ;;
-    esac
-
+    local port user password whitelist tcp_timeout udp_timeout uses_config_file
+    get_current_config_auto "$(detect_init_system)" || return 1
     echo "${whitelist}"
 }
 
@@ -947,6 +950,7 @@ start_service() {
     echo "  白名单: $(if [ -n "${whitelist}" ]; then echo "${whitelist}"; else echo "无（允许所有IP）"; fi)"
     echo "  服务管理器: ${init_system}"
     echo "  防火墙: $(detect_firewall)"
+    echo "  配置文件: ${CONFIG_FILE}"
 
     echo -e "${YELLOW}管理命令:${RESET}"
     case "${init_system}" in
@@ -980,8 +984,14 @@ modify() {
     local old_whitelist
 
     # 获取旧配置用于清理防火墙规则
-    old_port=$(get_current_port)
-    old_whitelist=$(get_current_whitelist)
+    old_port=$(get_current_port) || return 1
+    old_whitelist=$(get_current_whitelist) || return 1
+
+    if ! binary_supports_config "${INSTALL_DIR}/brume"; then
+        echo -e "${RED}当前程序不支持配置文件，请先更新到包含 --config 功能的版本${RESET}"
+        return 1
+    fi
+    write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" || return 1
 
     # 停止服务
     stop_service_by_init "${init_system}"
@@ -993,7 +1003,7 @@ modify() {
     fi
 
     # 更新服务文件
-    create_service "${init_system}" "${port}" "${user}" "${password}" "${whitelist}"
+    create_service "${init_system}"
 
     # 设置新的防火墙规则
     setup_firewall "${port}" "${whitelist}"
@@ -1016,8 +1026,8 @@ uninstall() {
     echo -e "${BLUE}=== Brume 服务器卸载 ===${RESET}"
 
     # 获取当前配置用于清理
-    current_port=$(get_current_port)
-    current_whitelist=$(get_current_whitelist)
+    current_port=$(get_current_port) || return 1
+    current_whitelist=$(get_current_whitelist) || return 1
 
     # 停止服务
     stop_service_by_init "${init_system}"
@@ -1040,6 +1050,11 @@ uninstall() {
     if [ -f "${binary_path}" ]; then
         echo "正在删除二进制文件..."
         execute_privileged rm -f "${binary_path}"
+    fi
+
+    if [ -f "${CONFIG_FILE}" ]; then
+        rm -f "${CONFIG_FILE}"
+        rmdir "${CONFIG_DIR}" 2>/dev/null || true
     fi
 
     echo -e "${GREEN}Brume 服务器卸载完成${RESET}"
@@ -1098,6 +1113,8 @@ get_install_config() {
     user="${DEFAULT_USER}"
     password="${DEFAULT_PASSWORD}"
     whitelist="${DEFAULT_WHITELIST}"
+    tcp_timeout="${DEFAULT_TCP_TIMEOUT}"
+    udp_timeout="${DEFAULT_UDP_TIMEOUT}"
     version=""
 
     # 获取端口号
@@ -1209,58 +1226,8 @@ get_modify_config() {
         exit 1
     fi
 
-    # 读取当前配置参数
-    local cmd_args=""
-
-    case "${init_system}" in
-        systemd)
-            local exec_start
-            exec_start=$(execute_privileged grep '^ExecStart=' "${service_file}" 2>/dev/null | head -n1)
-            cmd_args=$(echo "$exec_start" | sed "s|^ExecStart=${INSTALL_DIR}/brume ||")
-            ;;
-        openrc)
-            cmd_args=$(execute_privileged grep '^command_args=' "${service_file}" 2>/dev/null | head -n1 | sed 's/^command_args="//' | sed 's/"$//')
-            ;;
-        sysvinit)
-            cmd_args=$(execute_privileged grep '^DAEMON_ARGS=' "${service_file}" 2>/dev/null | head -n1 | sed 's/^DAEMON_ARGS="//' | sed 's/"$//')
-            ;;
-    esac
-
-    # 初始化默认值
-    port="${DEFAULT_PORT}"
-    user=""
-    password=""
-    whitelist=""
-
-    # 解析参数
-    set -- $cmd_args
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -p)
-                if [ -n "$2" ] && [ "$2" -ge 1 ] && [ "$2" -le 65535 ] 2>/dev/null; then
-                    port="$2"
-                    shift 2
-                else
-                    shift
-                fi
-                ;;
-            -user)
-                user="$2"
-                shift 2
-                ;;
-            -pwd)
-                password="$2"
-                shift 2
-                ;;
-            --whitelist)
-                whitelist="$2"
-                shift 2
-                ;;
-            *)
-                shift
-                ;;
-        esac
-    done
+    # 同时兼容旧服务参数与当前配置文件
+    get_current_config_auto "${init_system}" || exit 1
 
     # 显示当前配置
     echo -e "${GREEN}当前配置:${RESET}"
@@ -1422,15 +1389,32 @@ get_current_config_auto() {
     user=""
     password=""
     whitelist=""
+    tcp_timeout="${DEFAULT_TCP_TIMEOUT}"
+    udp_timeout="${DEFAULT_UDP_TIMEOUT}"
+    uses_config_file=false
 
-    # 简单解析已有的 cmd_args
-    set -- $cmd_args
+    if [[ " ${cmd_args} " == *" --config "* ]]; then
+        if [[ "${cmd_args}" != *"--config ${CONFIG_FILE}"* ]] || [ ! -f "${CONFIG_FILE}" ]; then
+            echo "服务配置文件路径无效，请检查 ${CONFIG_FILE}" >&2
+            return 1
+        fi
+        uses_config_file=true
+        load_config_file
+        return
+    fi
+
+    # 将旧服务参数拆分为数组，避免通配符展开
+    local -a legacy_args
+    read -r -a legacy_args <<< "${cmd_args}"
+    set -- "${legacy_args[@]}"
     while [ $# -gt 0 ]; do
         case "$1" in
             -p) port="$2"; shift 2 ;;
             -user) user="$2"; shift 2 ;;
             -pwd) password="$2"; shift 2 ;;
             --whitelist) whitelist="$2"; shift 2 ;;
+            --tcp-timeout) tcp_timeout="$2"; shift 2 ;;
+            --udp-timeout) udp_timeout="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -1441,7 +1425,7 @@ upgrade() {
     echo -e "${BLUE}=== Brume 服务器一键更新 ===${RESET}"
 
     # 1. 自动提取参数
-    get_current_config_auto "${init_system}"
+    get_current_config_auto "${init_system}" || return 1
     echo -e "已提取当前配置: 端口 ${port}, 用户 ${user:-无}, 白名单 ${whitelist:-无限制}"
 
     # 在停服前阻止防火墙规则误伤 SSH 端口
@@ -1457,20 +1441,34 @@ upgrade() {
     version=$(get_latest_version)
     echo -e "准备更新至版本: ${version}"
 
-    # 4. 停服并清理旧规则（为了重新安全挂载）
+    # 4. 停服前下载并检查新程序
+    prepare_binary "${version}" "${arch}"
+
+    # 5. 停服前迁移旧配置或收紧已有文件权限
+    if [ "${uses_config_file}" != true ]; then
+        if ! write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}"; then
+            rm -rf "${prepared_dir}"
+            return 1
+        fi
+    else
+        if ! chmod 700 "${CONFIG_DIR}" || ! chmod 600 "${CONFIG_FILE}"; then
+            rm -rf "${prepared_dir}"
+            return 1
+        fi
+    fi
+
+    # 6. 停服并清理旧规则（为了重新安全挂载）
     stop_service_by_init "${init_system}"
     if [ -n "${whitelist}" ]; then
         remove_firewall "${port}"
     fi
 
-    # 5. 下载最新二进制覆盖
-    download_and_install "${version}" "${arch}"
-
-    # 6. 重建服务与防火墙项（确保配置更新）
-    create_service "${init_system}" "${port}" "${user}" "${password}" "${whitelist}"
+    # 7. 安装并配置已经检查的新程序
+    install_prepared_binary
+    create_service "${init_system}"
     setup_firewall "${port}" "${whitelist}"
 
-    # 7. 重启服务
+    # 8. 重启服务
     restart_service_by_init "${init_system}"
 
     echo -e "${GREEN}Brume 服务器一键更新完成！${RESET}"
@@ -1531,8 +1529,9 @@ main() {
             # 下载并安装
             download_and_install "${version}" "${arch}"
 
-            # 创建服务
-            create_service "${init_system}" "${port}" "${user}" "${password}" "${whitelist}"
+            # 创建仅使用配置文件路径的服务
+            write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" || exit 1
+            create_service "${init_system}"
 
             # 设置防火墙规则
             setup_firewall "${port}" "${whitelist}"
@@ -1581,5 +1580,7 @@ main() {
     esac
 }
 
-# 执行主函数
-main "$@"
+# 直接运行脚本时进入交互式菜单
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
