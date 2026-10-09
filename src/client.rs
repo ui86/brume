@@ -1,11 +1,57 @@
+use crate::happy_eyeballs::happy_eyeballs_connect;
 use crate::protocol::{self, Host, Target};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
+use tokio::runtime::{Builder, Runtime};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_BUFFER_SIZE: usize = 65_535;
+static CONNECT_RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+
+fn connector_runtime() -> io::Result<&'static Runtime> {
+    CONNECT_RUNTIME
+        .get_or_init(|| {
+            Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| io::Error::other(error.clone()))
+}
+
+fn connect_proxy(server: String) -> io::Result<TcpStream> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let task = connector_runtime()?.spawn(async move {
+        let result = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            let addresses: Vec<_> = tokio::net::lookup_host(server.as_str()).await?.collect();
+            let stream = happy_eyeballs_connect(&addresses, CONNECT_TIMEOUT).await?;
+            stream.into_std()
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接代理服务器超时"))
+        .and_then(|result| result);
+        let _ = sender.send(result);
+    });
+    let stream = match receiver.recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(1)) {
+        Ok(result) => result?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            task.abort();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "连接代理服务器超时",
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(io::Error::other("代理连接任务意外退出"));
+        }
+    };
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
 
 pub struct Client {
     server: String,
@@ -59,22 +105,7 @@ impl Client {
     }
 
     fn negotiate(&self) -> io::Result<TcpStream> {
-        let mut last_error = None;
-        let mut stream = None;
-        for address in self.server.to_socket_addrs()? {
-            match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
-                Ok(connection) => {
-                    stream = Some(connection);
-                    break;
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-        let mut stream = stream.ok_or_else(|| {
-            last_error.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "代理服务器地址没有解析结果")
-            })
-        })?;
+        let mut stream = connect_proxy(self.server.clone())?;
         stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
         stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
         let method = if self.username.is_empty() { 0 } else { 2 };
