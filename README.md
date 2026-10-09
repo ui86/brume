@@ -1,155 +1,63 @@
-# Brume 服务器
+# Brume
 
-一个轻量级、功能完整的SOCKS5代理服务器实现，支持TCP/UDP协议、用户认证、IP白名单功能，以及便捷的安装、卸载和配置修改。
+Brume 是用 Rust 实现的轻量级 SOCKS5 代理服务器，支持 TCP CONNECT、UDP ASSOCIATE、用户名密码认证和 IP/CIDR 白名单。
 
-## 功能特点
+## 功能
 
-- 支持 SOCKS5 协议标准的 CONNECT 和 UDP ASSOCIATE 命令
-- 支持无认证和用户名/密码认证方式
-- 支持TCP和UDP代理
-- 支持IP白名单功能，可以限制允许连接的客户端IP地址
-- 可配置连接超时时间
+- SOCKS5 无认证与用户名密码认证（RFC 1929）
+- IPv4、IPv6 和域名目标地址
+- TCP 双向转发及半关闭
+- UDP 关联转发；仅接受存活的 TCP 关联对应的 UDP 数据报
+- 精确 IP 和 CIDR 白名单，对 TCP 与 UDP 同时生效
+- 可选 TCP 空闲超时、UDP 流空闲超时
+- 收到 Ctrl+C 或终止信号后停止监听
 
-## 安装
+## 构建与安装
 
-### 使用安装脚本（推荐）
-
-项目提供了便捷的安装脚本，采用交互式操作，支持安装、卸载和修改配置。
-
-#### 前提条件
-
-- Linux系统（支持amd64和arm64架构）
-- systemd服务管理器
-- curl命令行工具
-
-#### 安装脚本功能
-
-- 自动检测系统架构
-- 下载最新版本的二进制文件
-- 配置systemd服务
-- 支持自定义端口、认证信息和IP白名单
-- 提供卸载和配置修改功能
-- 采用交互式界面，操作更加直观友好
-
-#### 使用方法
+需要 Rust 稳定版工具链。克隆仓库后执行：
 
 ```bash
-rm -f install.sh && curl -O https://raw.githubusercontent.com/ui86/brume/main/install.sh || wget -O ${_##*/} $_ && bash install.sh
+cargo build --release --locked
+./target/release/brume
 ```
 
-运行脚本后，会进入交互式界面，您可以根据提示选择需要的操作（安装、卸载、修改配置）并设置相关参数。
-
-### 手动编译安装
-
-如果您希望手动编译安装：
+Linux amd64 和 arm64 可使用仓库中的 `install.sh` 安装、更新、卸载或修改配置。脚本从 GitHub Release 下载与原有命名规则兼容的 `brume-版本-linux-架构.tar.gz`。运行交互式脚本：
 
 ```bash
-# 克隆仓库
-git clone https://github.com/ui86/brume.git
-cd brume
-
-# 编译
-go build
-
-# 手动运行
-./brume
-
-# 或者手动安装到系统
-chmod +x brume
-sudo mv brume /usr/local/bin/
+bash install.sh
 ```
 
-## 使用方法
+## 命令行参数
 
-### 基本用法
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-p`、`--port` | `1080` | TCP 和 UDP 监听端口，范围 1～65535 |
+| `-user`、`--user` | 空 | 认证用户名 |
+| `-pwd`、`--pwd` | 空 | 认证密码，须与用户名同时设置 |
+| `--whitelist` | 空 | 允许的 IP 或 CIDR，多个条目用逗号分隔；空值允许所有来源 |
+| `--tcp-timeout` | `0` | TCP 转发读写空闲超时，单位秒；0 表示不限制 |
+| `--udp-timeout` | `60` | UDP 目标流空闲超时，单位秒；0 表示不限制 |
+| `-h`、`--help` |  | 显示帮助 |
+| `--version` |  | 显示版本 |
 
-启动默认配置的Brume服务器（监听1080端口，无认证，允许所有IP连接）：
+例如：
 
 ```bash
-./brume
+./target/release/brume -p 8080 -user admin -pwd password123 --whitelist 127.0.0.1,192.168.1.0/24
 ```
 
-### 指定端口
+## 协议与安全说明
 
-使用 `-p` 参数指定服务器监听端口：
+客户端必须先通过 TCP 协商并发送 UDP ASSOCIATE 请求，保持控制连接开启。关联建立后，UDP 中转只接收对应客户端 IP 和端口的数据报；客户端在请求中填入端口 0 时，服务端会在首个有效数据报到达时确定端口。SOCKS5 的 UDP 分片不受支持。
+
+未设置认证和白名单时，服务器会向所有来源开放。用户名密码认证按照 SOCKS5 标准以明文传输，公网使用时应在可信网络或加密隧道中部署。域名使用系统 DNS 解析器。
+
+## 验证
 
 ```bash
-./brume -p 8080
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
 ```
 
-### 启用认证
-
-使用 `-user` 和 `-pwd` 参数设置用户名和密码：
-
-```bash
-./brume -user admin -pwd password123
-```
-
-### 启用IP白名单
-
-使用 `--whitelist` 参数指定允许连接的客户端IP地址，多个IP用逗号分隔：
-
-```bash
-./brume --whitelist 127.0.0.1,192.168.1.100,1.1.1.1
-```
-
-### 组合使用
-
-可以同时使用多个参数：
-
-```bash
-./brume -p 8080 -user admin -pwd password123 --whitelist 127.0.0.1,192.168.1.0/24
-```
-
-## 服务命令行参数说明
-
-直接运行二进制文件时支持以下参数：
-
-| 参数 | 简写 | 默认值 | 说明 |
-|------|------|--------|------|
-| `--user` | | 空 | 认证用户名，不设置则不启用认证 |
-| `--pwd` | | 空 | 认证密码，与用户名同时设置才生效 |
-| `--port` | `-p` | 1080 | 服务器监听端口 |
-| `--whitelist` | | 空 | 允许连接的IP地址列表，多个IP用逗号分隔，为空时允许所有IP连接 |
-
-## 核心功能说明
-
-### 1. 服务器启动流程
-
-- 解析命令行参数
-- 创建SOCKS5服务器实例
-- 启动TCP和UDP监听器
-- 处理客户端连接请求
-
-### 2. 连接处理流程
-
-1. 接收客户端连接
-2. 检查客户端IP是否在白名单中（如果启用了白名单）
-3. 进行认证协商（无认证或用户名密码认证）
-4. 处理客户端请求（CONNECT或UDP ASSOCIATE）
-5. 建立与目标服务器的连接并转发数据
-
-### 3. IP白名单功能
-
-白名单功能允许管理员限制只有特定IP地址的客户端可以连接到SOCKS5服务器。当客户端连接时，服务器会检查其IP地址是否在白名单中，只有在白名单中的IP地址才能继续进行认证和请求处理。
-
-## 依赖说明
-
-- [github.com/txthinking/runnergroup](https://github.com/txthinking/runnergroup) - 提供并发任务管理功能，用于管理TCP和UDP监听器
-
-## 性能与安全
-
-- 服务器使用goroutine处理每个客户端连接，具有良好的并发性能
-- 启用认证和白名单功能可以提高服务器安全性
-- 可以通过设置超时时间避免空闲连接占用资源
-- [核心性能基准与优化对比](docs/benchmark-comparison.md)
-
-## License
-
-MIT License
-
-## 注意事项
-
-- 如果不设置白名单，服务器将允许所有IP地址连接，请谨慎在公网环境中使用
-- 用户名和密码以明文形式传输，请在安全的网络环境中使用或考虑使用TLS加密
-- UDP协议本身不提供可靠传输，某些应用场景下可能会出现数据包丢失
+[重构分析与验证范围](docs/benchmark-comparison.md)
