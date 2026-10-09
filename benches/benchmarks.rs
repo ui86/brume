@@ -159,23 +159,22 @@ fn tcp_benchmarks() {
             match remote.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_nonblocking(false).unwrap();
-                    thread::spawn(move || {
-                        let mut buffer = [0; 32 * 1024];
-                        loop {
-                            match stream.read(&mut buffer) {
-                                Ok(0) => break,
-                                Ok(length) => {
-                                    if stream.write_all(&buffer[..length]).is_err() {
-                                        break;
-                                    }
+                    // 顺序处理基准连接，避免为大量短连接创建系统线程
+                    let mut buffer = [0; 32 * 1024];
+                    loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(length) => {
+                                if stream.write_all(&buffer[..length]).is_err() {
+                                    break;
                                 }
-                                Err(_) => break,
                             }
+                            Err(_) => break,
                         }
-                    });
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => panic!("TCP 回显监听失败：{error}"),
             }
@@ -200,7 +199,7 @@ fn tcp_benchmarks() {
     let server_thread = thread::spawn(move || server.run().unwrap());
     let client = Client::new(address.to_string(), "", "").unwrap();
     let target = Target::from(destination);
-    measure("TCP 本机连接与协商", 20, 1, || {
+    measure("TCP 本机连接与协商", 200, 1, || {
         black_box(client.connect(target.clone()).unwrap());
     });
     let mut stream = client.connect(target).unwrap();
