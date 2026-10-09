@@ -560,19 +560,25 @@ setup_firewall_firewalld() {
         echo "  允许 ${ip} 访问端口 ${port}..."
         execute_privileged firewall-cmd --permanent --zone=brume \
             --add-rich-rule="rule family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
+        execute_privileged firewall-cmd --permanent --zone=brume \
+            --add-rich-rule="rule family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept"
     done
 
     # 将接口绑定到 brume zone（如果需要可以指定接口）
     # 使用默认 zone 来添加拒绝规则
     execute_privileged firewall-cmd --permanent --zone=public \
-        --add-rich-rule="rule family=\"ipv4\" port port=\"${port}\" protocol=\"tcp\" drop"
+        --add-rich-rule="rule priority=\"10\" family=\"ipv4\" port port=\"${port}\" protocol=\"tcp\" drop"
+    execute_privileged firewall-cmd --permanent --zone=public \
+        --add-rich-rule="rule priority=\"10\" family=\"ipv4\" port port=\"${port}\" protocol=\"udp\" drop"
 
     # 在 public zone 中添加白名单 IP 的放行规则（优先级更高）
     for ip in "${IPS[@]}"; do
         ip=$(echo "${ip}" | xargs)
         [ -z "${ip}" ] && continue
         execute_privileged firewall-cmd --permanent --zone=public \
-            --add-rich-rule="rule family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
+            --add-rich-rule="rule priority=\"-10\" family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
+        execute_privileged firewall-cmd --permanent --zone=public \
+            --add-rich-rule="rule priority=\"-10\" family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept"
     done
 
     execute_privileged firewall-cmd --reload
@@ -604,10 +610,12 @@ setup_firewall_ufw() {
         echo "  允许 ${ip} 访问端口 ${port}..."
         # 添加注释标识规则来源
         execute_privileged ufw allow from "${ip}" to any port "${port}" proto tcp comment "brume-whitelist"
+        execute_privileged ufw allow from "${ip}" to any port "${port}" proto udp comment "brume-whitelist"
     done
 
     # 拒绝其他所有连接到该端口
     execute_privileged ufw deny to any port "${port}" proto tcp comment "brume-deny-default"
+    execute_privileged ufw deny to any port "${port}" proto udp comment "brume-deny-default"
 
     echo -e "${GREEN}ufw 防火墙规则配置完成${RESET}"
 }
@@ -633,10 +641,12 @@ setup_firewall_nftables() {
         [ -z "${ip}" ] && continue
         echo "  允许 ${ip} 访问端口 ${port}..."
         execute_privileged nft add rule inet brume input ip saddr "${ip}" tcp dport "${port}" accept
+        execute_privileged nft add rule inet brume input ip saddr "${ip}" udp dport "${port}" accept
     done
 
     # 拒绝其他所有到该端口的连接
     execute_privileged nft add rule inet brume input tcp dport "${port}" drop
+    execute_privileged nft add rule inet brume input udp dport "${port}" drop
 
     # 持久化 nftables 规则
     if [ -f /etc/nftables.conf ]; then
@@ -663,6 +673,7 @@ setup_firewall_iptables() {
 
     # 将针对目标端口的流量导向自定义 chain
     execute_privileged iptables -I INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}"
+    execute_privileged iptables -I INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}"
 
     # 添加白名单 IP 的放行规则
     IFS=',' read -ra IPS <<< "${whitelist}"
@@ -671,10 +682,12 @@ setup_firewall_iptables() {
         [ -z "${ip}" ] && continue
         echo "  允许 ${ip} 访问端口 ${port}..."
         execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p tcp --dport "${port}" -j ACCEPT
+        execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p udp --dport "${port}" -j ACCEPT
     done
 
     # 拒绝其他所有到该端口的连接
     execute_privileged iptables -A "${IPTABLES_CHAIN}" -p tcp --dport "${port}" -j DROP
+    execute_privileged iptables -A "${IPTABLES_CHAIN}" -p udp --dport "${port}" -j DROP
 
     # 持久化 iptables 规则
     persist_iptables_rules
@@ -743,7 +756,7 @@ remove_firewall_ufw() {
         # 仅删除带有 Brume 注释的规则，避免误删同端口的现有规则
         local rule_nums
         rule_nums=$(execute_privileged env LC_ALL=C ufw status numbered 2>/dev/null \
-            | grep -E "^\\[[[:space:]]*[0-9]+\\][[:space:]]+${port}/tcp([[:space:]]|$)" \
+            | grep -E "^\\[[[:space:]]*[0-9]+\\][[:space:]]+${port}/(tcp|udp)([[:space:]]|$)" \
             | grep -E '# brume-(whitelist|deny-default)([[:space:]]|$)' \
             | grep -oP '^\[\s*\K[0-9]+' \
             | sort -rn)
@@ -785,6 +798,7 @@ remove_firewall_iptables() {
     # 移除 INPUT 链中指向自定义 chain 的引用
     if [ -n "${port}" ]; then
         execute_privileged iptables -D INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
+        execute_privileged iptables -D INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
     else
         # 尝试通过 chain 名称查找并删除所有引用
         while execute_privileged iptables -D INPUT -j "${IPTABLES_CHAIN}" 2>/dev/null; do :; done
