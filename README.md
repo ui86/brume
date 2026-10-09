@@ -9,7 +9,7 @@ Brume 是用 Rust 编写的 SOCKS5 代理服务器及客户端库，支持 TCP C
 - TCP 双向转发及半关闭
 - UDP 关联转发；仅接受存活的 TCP 关联对应的 UDP 数据报
 - 精确 IP 和 CIDR 白名单，对 TCP 与 UDP 同时生效
-- 可选 TCP 读写超时、UDP 目标流空闲超时
+- 可选 TCP 双向转发空闲超时、UDP 目标流空闲超时
 - 可配置 DNS 服务器与按 TTL 缓存的域名解析
 - 收到 Ctrl+C 或终止信号后停止监听
 
@@ -24,7 +24,7 @@ cargo build --release --locked
 
 上述命令使用默认端口 `1080`，仅允许本机客户端连接。服务端在同一端口监听 TCP 和 UDP，使用 Ctrl+C 停止。
 
-Linux amd64 和 arm64 可运行交互式安装脚本。脚本从 GitHub Release 下载 `brume-版本-linux-架构.tar.gz`，提供安装、更新、修改配置和卸载选项，并配置可用的服务管理器与防火墙。运行脚本需要 root 或 sudo 权限：
+Linux amd64 和 arm64 可运行交互式安装脚本。脚本从 GitHub Release 下载 `brume-版本-linux-架构.tar.gz`，提供安装、更新、修改配置和卸载选项，并为同一端口的 TCP、UDP 及 IPv4、IPv6 配置可用的防火墙。运行脚本需要 root 或 sudo 权限：
 
 ```bash
 bash install.sh
@@ -68,8 +68,8 @@ dns_servers=8.8.8.8,1.1.1.1
 | `-user`、`--user` | 空 | 认证用户名 |
 | `-pwd`、`--pwd` | 空 | 认证密码，须与用户名同时设置 |
 | `--whitelist` | 空 | 允许的 IP 或 CIDR，多个条目用逗号分隔；空值允许所有来源 |
-| `--tcp-timeout` | `0` | TCP 转发读写超时，单位秒；0 表示不限制 |
-| `--udp-timeout` | `60` | UDP 目标流空闲超时，单位秒；0 表示不限制 |
+| `--tcp-timeout` | `0` | TCP 双向转发空闲超时，单位秒；任一方向成功转发数据都会续期，0 表示不限制 |
+| `--udp-timeout` | `60` | UDP 目标流空闲超时，单位秒；请求或回复都会续期，0 表示不限制 |
 | `--dns-servers` | `8.8.8.8,1.1.1.1` | 服务端 DNS 地址，多个条目用逗号分隔；支持 `IP:端口` |
 | `-h`、`--help` |  | 显示帮助 |
 | `--version` |  | 显示版本 |
@@ -90,11 +90,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-访问需要认证的服务端时，在 `Client::new` 中同时传入用户名和密码。`connect` 返回可读写的 TCP 连接。`associate` 返回 UDP 关联对象；其 `send` 和 `recv` 方法负责封装及解析 SOCKS5 数据报，并在对象存活期间保持 TCP 控制连接。客户端还可通过 `set_tcp_timeout` 和 `set_udp_timeout` 设置超时。
+访问需要认证的服务端时，在 `Client::new` 中同时传入用户名和密码。`connect` 返回可读写的 TCP 连接；代理地址为 IP 时直接连接，域名解析和多个地址的连接尝试共享 10 秒时限。`associate` 返回 UDP 关联对象；其 `send` 和 `recv` 方法负责封装及解析 SOCKS5 数据报，并在对象存活期间保持 TCP 控制连接。客户端还可通过 `set_tcp_timeout` 和 `set_udp_timeout` 设置超时。
 
 ## 协议与安全说明
 
-客户端必须先通过 TCP 协商并发送 UDP ASSOCIATE 请求，保持控制连接开启。关联建立后，UDP 中转只接收对应客户端 IP 和端口的数据报；客户端在请求中填入端口 0 时，服务端会在首个有效数据报到达时确定端口。SOCKS5 的 UDP 分片不受支持。
+客户端必须先通过 TCP 协商并发送 UDP ASSOCIATE 请求，保持控制连接开启。客户端库会声明实际 UDP 端口；关联建立后，UDP 中转只接收对应客户端 IP 和端口的数据报。外部客户端在请求中填入端口 0 时，服务端会在首个有效数据报到达时确定端口；同一 IP 只能同时保留一个尚未绑定的端口 0 关联。SOCKS5 的 UDP 分片不受支持。
 
 未设置认证和白名单时，服务器会向所有来源开放。用户名密码认证按照 SOCKS5 标准以明文传输；手动使用 `-pwd` 时，密码会出现在进程参数中，建议通过权限受限的配置文件传入。旧服务命令行中已经暴露过的密码应在迁移后更换。公网部署仍应使用可信网络或加密隧道，并避免复用敏感密码。普通的客户端断开可能产生 `Broken pipe` 或 `Connection reset by peer`，服务端不会将这两类错误写入日志；其他连接错误仍会记录。
 
