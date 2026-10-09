@@ -79,12 +79,18 @@ impl Server {
         let tcp_socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
         tcp_socket.set_only_v6(false)?;
         tcp_socket.set_nonblocking(true)?;
+        tcp_socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        let _ = tcp_socket.set_reuse_port(true);
         tcp_socket.bind(&address.into())?;
         tcp_socket.listen(1024)?;
         let tcp: std::net::TcpListener = tcp_socket.into();
         let udp_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         udp_socket.set_only_v6(false)?;
         udp_socket.set_nonblocking(true)?;
+        udp_socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        let _ = udp_socket.set_reuse_port(true);
         let udp_address =
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), tcp.local_addr()?.port());
         udp_socket.bind(&udp_address.into())?;
@@ -282,7 +288,7 @@ async fn handle_client(
         };
 
     match command {
-        protocol::CONNECT => connect(stream, target, config.tcp_timeout, &dns).await,
+        protocol::CONNECT => connect(stream, target, config.tcp_timeout, &dns, shutdown).await,
         protocol::UDP_ASSOCIATE => associate(stream, target, udp, associations, id, shutdown).await,
         _ => {
             let address = unspecified(stream.local_addr()?.ip());
@@ -296,32 +302,41 @@ async fn connect(
     target: Target,
     timeout: Option<Duration>,
     dns: &DnsResolver,
+    shutdown: CancellationToken,
 ) -> io::Result<()> {
-    let address = unspecified(client.local_addr()?.ip());
-    let addresses = match dns.lookup(&target).await {
-        Ok(addresses) => addresses,
-        Err(error) => {
-            protocol::write_reply_async(&mut client, protocol::HOST_UNREACHABLE, address).await?;
-            return Err(error);
-        }
+    let connect_task = async {
+        let address = unspecified(client.local_addr()?.ip());
+        let addresses = match dns.lookup(&target).await {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                protocol::write_reply_async(&mut client, protocol::HOST_UNREACHABLE, address)
+                    .await?;
+                return Err(error);
+            }
+        };
+
+        // 使用 Happy Eyeballs 双栈并发竞速建立连接
+        let mut remote = match happy_eyeballs_connect(&addresses, HANDSHAKE_TIMEOUT).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                let status = if error.kind() == io::ErrorKind::ConnectionRefused {
+                    protocol::CONNECTION_REFUSED
+                } else {
+                    protocol::HOST_UNREACHABLE
+                };
+                protocol::write_reply_async(&mut client, status, address).await?;
+                return Err(error);
+            }
+        };
+
+        protocol::write_reply_async(&mut client, protocol::SUCCESS, remote.local_addr()?).await?;
+        forward_bidirectional(&mut client, &mut remote, timeout).await
     };
 
-    // 使用 Happy Eyeballs 双栈并发竞速建立连接
-    let mut remote = match happy_eyeballs_connect(&addresses, HANDSHAKE_TIMEOUT).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            let status = if error.kind() == io::ErrorKind::ConnectionRefused {
-                protocol::CONNECTION_REFUSED
-            } else {
-                protocol::HOST_UNREACHABLE
-            };
-            protocol::write_reply_async(&mut client, status, address).await?;
-            return Err(error);
-        }
-    };
-
-    protocol::write_reply_async(&mut client, protocol::SUCCESS, remote.local_addr()?).await?;
-    forward_bidirectional(&mut client, &mut remote, timeout).await
+    tokio::select! {
+        _ = shutdown.cancelled() => Ok(()),
+        res = connect_task => res,
+    }
 }
 
 async fn forward_bidirectional(

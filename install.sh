@@ -157,6 +157,8 @@ Type=simple
 ExecStart=${INSTALL_DIR}/brume --config ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec=5s
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
