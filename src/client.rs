@@ -122,7 +122,7 @@ impl Client {
         let socket = UdpSocket::bind(bind)?;
         let request = Target {
             host: Host::Ip(bind.ip()),
-            port: 0,
+            port: socket.local_addr()?.port(),
         };
         protocol::write_request(&mut control, protocol::UDP_ASSOCIATE, &request)?;
         let (status, reply) = protocol::read_reply(&mut control)?;
@@ -301,5 +301,30 @@ mod tests {
     #[test]
     fn rejects_incomplete_credentials() {
         assert!(Client::new("127.0.0.1:1080", "admin", "").is_err());
+    }
+
+    #[test]
+    fn udp_associate_declares_local_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+            let (command, request) = protocol::read_request(&mut stream).unwrap();
+            assert_eq!(command, protocol::UDP_ASSOCIATE);
+            protocol::write_reply(&mut stream, protocol::SUCCESS, proxy).unwrap();
+            request.port
+        });
+        let client = Client::new(proxy.to_string(), "", "").unwrap();
+        let association = client
+            .associate(Target::from("127.0.0.1:53".parse::<SocketAddr>().unwrap()))
+            .unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            association.local_addr().unwrap().port()
+        );
     }
 }
