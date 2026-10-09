@@ -93,6 +93,7 @@ struct Association {
     alive: AtomicBool,
     stopped: CancellationToken,
     flows: Mutex<HashMap<Target, Arc<FlowSlot>>>,
+    preferred_addresses: Mutex<HashMap<Target, usize>>,
 }
 
 impl Association {
@@ -121,6 +122,9 @@ struct Flow {
     socket: Arc<tokio::net::UdpSocket>,
     last_activity: Mutex<Instant>,
     active: AtomicBool,
+    stopped: CancellationToken,
+    address_index: usize,
+    address_count: usize,
 }
 
 struct FlowSlot {
@@ -140,6 +144,27 @@ fn normalize(ip: IpAddr) -> IpAddr {
 
 fn endpoint_key(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(normalize(address.ip()), address.port())
+}
+
+fn remember_udp_address(association: &Association, target: &Target, index: usize) {
+    let mut preferred = association.preferred_addresses.lock().unwrap();
+    if preferred.len() >= MAX_FLOWS_PER_ASSOCIATION
+        && !preferred.contains_key(target)
+        && let Some(oldest) = preferred.keys().next().cloned()
+    {
+        preferred.remove(&oldest);
+    }
+    preferred.insert(target.clone(), index);
+}
+
+fn advance_udp_address(association: &Association, target: &Target, flow: &Flow) {
+    if flow.address_count > 1 {
+        remember_udp_address(
+            association,
+            target,
+            (flow.address_index + 1) % flow.address_count,
+        );
+    }
 }
 
 pub struct Server {
@@ -541,6 +566,7 @@ async fn associate(
         alive: AtomicBool::new(true),
         stopped: CancellationToken::new(),
         flows: Mutex::new(HashMap::new()),
+        preferred_addresses: Mutex::new(HashMap::new()),
     });
     if !associations
         .lock()
@@ -659,7 +685,9 @@ async fn handle_udp_packet(
         return;
     }
 
-    for _ in 0..2 {
+    let mut attempts = 0;
+    let mut stale_retries = 0;
+    loop {
         let slot = {
             let mut flows = association.flows.lock().unwrap();
             if let Some(slot) = flows.get(&target) {
@@ -683,15 +711,43 @@ async fn handle_udp_packet(
             .flow
             .get_or_init(|| async {
                 let addresses = dns.lookup(&target).await.ok()?;
-                let destination = addresses[0];
-                let std_socket = std::net::UdpSocket::bind(unspecified(destination.ip())).ok()?;
-                std_socket.connect(destination).ok()?;
-                std_socket.set_nonblocking(true).ok()?;
-                let socket = tokio::net::UdpSocket::from_std(std_socket).ok()?;
+                let start = association
+                    .preferred_addresses
+                    .lock()
+                    .unwrap()
+                    .get(&target)
+                    .copied()
+                    .unwrap_or(0)
+                    % addresses.len();
+                let mut selected = None;
+                for offset in 0..addresses.len() {
+                    let index = (start + offset) % addresses.len();
+                    let destination = addresses[index];
+                    let Ok(std_socket) = std::net::UdpSocket::bind(unspecified(destination.ip()))
+                    else {
+                        continue;
+                    };
+                    if std_socket.connect(destination).is_err()
+                        || std_socket.set_nonblocking(true).is_err()
+                    {
+                        continue;
+                    }
+                    if let Ok(socket) = tokio::net::UdpSocket::from_std(std_socket) {
+                        selected = Some((destination, index, socket));
+                        break;
+                    }
+                }
+                let (destination, address_index, socket) = selected?;
+                if addresses.len() > 1 {
+                    remember_udp_address(association, &target, address_index);
+                }
                 let flow = Arc::new(Flow {
                     socket: Arc::new(socket),
                     last_activity: Mutex::new(Instant::now()),
                     active: AtomicBool::new(true),
+                    stopped: CancellationToken::new(),
+                    address_index,
+                    address_count: addresses.len(),
                 });
                 let worker = Arc::clone(&flow);
                 let association = Arc::clone(association);
@@ -720,16 +776,29 @@ async fn handle_udp_packet(
         };
         if !flow.active.load(Ordering::Relaxed) {
             remove_flow_slot(association, &target, &slot);
+            stale_retries += 1;
+            if stale_retries > 2 {
+                return;
+            }
             continue;
         }
         if !association.alive.load(Ordering::Relaxed) {
             return;
         }
+        attempts += 1;
         *flow.last_activity.lock().unwrap() = Instant::now();
         if flow.socket.send(&payload).await.is_ok() {
             *flow.last_activity.lock().unwrap() = Instant::now();
+            return;
         }
-        return;
+        if flow.active.swap(false, Ordering::Relaxed) {
+            advance_udp_address(association, &target, flow);
+        }
+        flow.stopped.cancel();
+        remove_flow_slot(association, &target, &slot);
+        if attempts >= flow.address_count {
+            return;
+        }
     }
 }
 
@@ -753,12 +822,15 @@ async fn receive_remote(
     timeout: Duration,
 ) {
     let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
+    let mut received_reply = false;
+    let mut failed = false;
     while association.alive.load(Ordering::Relaxed) {
         let deadline = if timeout.is_zero() {
             None
         } else {
             let deadline = *flow.last_activity.lock().unwrap() + timeout;
             if Instant::now() >= deadline {
+                failed = !received_reply;
                 break;
             }
             Some(tokio::time::Instant::from_std(deadline))
@@ -766,12 +838,14 @@ async fn receive_remote(
         let received = if let Some(deadline) = deadline {
             tokio::select! {
                 _ = association.stopped.cancelled() => break,
+                _ = flow.stopped.cancelled() => break,
                 _ = tokio::time::sleep_until(deadline) => continue,
                 result = flow.socket.recv(&mut buffer[22..]) => result,
             }
         } else {
             tokio::select! {
                 _ = association.stopped.cancelled() => break,
+                _ = flow.stopped.cancelled() => break,
                 result = flow.socket.recv(&mut buffer[22..]) => result,
             }
         };
@@ -781,6 +855,7 @@ async fn receive_remote(
                 if !association.alive.load(Ordering::Relaxed) {
                     break;
                 }
+                received_reply = true;
                 *flow.last_activity.lock().unwrap() = Instant::now();
                 let source = { *association.endpoint.lock().unwrap() };
                 if let Some(source) = source {
@@ -790,11 +865,16 @@ async fn receive_remote(
                     let _ = relay.send_to(&buffer[start..22 + length], source).await;
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                failed = true;
+                break;
+            }
         }
     }
 
-    flow.active.store(false, Ordering::Relaxed);
+    if flow.active.swap(false, Ordering::Relaxed) && failed {
+        advance_udp_address(&association, &target, &flow);
+    }
     remove_flow_slot(&association, &target, &slot);
 }
 
@@ -882,6 +962,7 @@ mod tests {
             alive: AtomicBool::new(true),
             stopped: CancellationToken::new(),
             flows: Mutex::new(HashMap::new()),
+            preferred_addresses: Mutex::new(HashMap::new()),
         })
     }
 
@@ -934,6 +1015,9 @@ mod tests {
             socket: Arc::new(socket),
             last_activity: Mutex::new(Instant::now()),
             active: AtomicBool::new(true),
+            stopped: CancellationToken::new(),
+            address_index: 0,
+            address_count: 2,
         });
         let target = Target::from(destination);
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
@@ -949,6 +1033,7 @@ mod tests {
             alive: AtomicBool::new(true),
             stopped: CancellationToken::new(),
             flows: Mutex::new(HashMap::from([(target.clone(), slot)])),
+            preferred_addresses: Mutex::new(HashMap::new()),
         });
         let relay = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         (association, flow, relay, target, destination)
@@ -986,7 +1071,7 @@ mod tests {
             slot,
             relay,
             Arc::clone(&association),
-            target,
+            target.clone(),
             destination,
             Duration::from_millis(300),
         ));
@@ -999,6 +1084,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(association.flows.lock().unwrap().is_empty());
+        assert_eq!(
+            association.preferred_addresses.lock().unwrap().get(&target),
+            Some(&1)
+        );
     }
 
     #[test]
