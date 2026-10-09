@@ -557,28 +557,34 @@ setup_firewall_firewalld() {
     for ip in "${IPS[@]}"; do
         ip=$(echo "${ip}" | xargs)  # 去除空格
         [ -z "${ip}" ] && continue
+        local family=ipv4
+        [[ "${ip}" == *:* ]] && family=ipv6
         echo "  允许 ${ip} 访问端口 ${port}..."
         execute_privileged firewall-cmd --permanent --zone=brume \
-            --add-rich-rule="rule family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
+            --add-rich-rule="rule family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
         execute_privileged firewall-cmd --permanent --zone=brume \
-            --add-rich-rule="rule family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept"
+            --add-rich-rule="rule family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept"
     done
 
     # 将接口绑定到 brume zone（如果需要可以指定接口）
     # 使用默认 zone 来添加拒绝规则
-    execute_privileged firewall-cmd --permanent --zone=public \
-        --add-rich-rule="rule priority=\"10\" family=\"ipv4\" port port=\"${port}\" protocol=\"tcp\" drop"
-    execute_privileged firewall-cmd --permanent --zone=public \
-        --add-rich-rule="rule priority=\"10\" family=\"ipv4\" port port=\"${port}\" protocol=\"udp\" drop"
+    for family in ipv4 ipv6; do
+        execute_privileged firewall-cmd --permanent --zone=public \
+            --add-rich-rule="rule priority=\"10\" family=\"${family}\" port port=\"${port}\" protocol=\"tcp\" drop"
+        execute_privileged firewall-cmd --permanent --zone=public \
+            --add-rich-rule="rule priority=\"10\" family=\"${family}\" port port=\"${port}\" protocol=\"udp\" drop"
+    done
 
     # 在 public zone 中添加白名单 IP 的放行规则（优先级更高）
     for ip in "${IPS[@]}"; do
         ip=$(echo "${ip}" | xargs)
         [ -z "${ip}" ] && continue
+        local family=ipv4
+        [[ "${ip}" == *:* ]] && family=ipv6
         execute_privileged firewall-cmd --permanent --zone=public \
-            --add-rich-rule="rule priority=\"-10\" family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
+            --add-rich-rule="rule priority=\"-10\" family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
         execute_privileged firewall-cmd --permanent --zone=public \
-            --add-rich-rule="rule priority=\"-10\" family=\"ipv4\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept"
+            --add-rich-rule="rule priority=\"-10\" family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept"
     done
 
     execute_privileged firewall-cmd --reload
@@ -639,9 +645,11 @@ setup_firewall_nftables() {
     for ip in "${IPS[@]}"; do
         ip=$(echo "${ip}" | xargs)
         [ -z "${ip}" ] && continue
+        local address_family=ip
+        [[ "${ip}" == *:* ]] && address_family=ip6
         echo "  允许 ${ip} 访问端口 ${port}..."
-        execute_privileged nft add rule inet brume input ip saddr "${ip}" tcp dport "${port}" accept
-        execute_privileged nft add rule inet brume input ip saddr "${ip}" udp dport "${port}" accept
+        execute_privileged nft add rule inet brume input "${address_family}" saddr "${ip}" tcp dport "${port}" accept
+        execute_privileged nft add rule inet brume input "${address_family}" saddr "${ip}" udp dport "${port}" accept
     done
 
     # 拒绝其他所有到该端口的连接
@@ -662,6 +670,16 @@ setup_firewall_nftables() {
 setup_firewall_iptables() {
     local port=$1
     local whitelist=$2
+    local has_ip6tables=false
+
+    if command -v ip6tables &> /dev/null; then
+        has_ip6tables=true
+    elif [[ "${whitelist}" == *:* ]]; then
+        echo -e "${RED}IPv6 白名单需要 ip6tables${RESET}" >&2
+        return 1
+    else
+        echo -e "${YELLOW}未找到 ip6tables，无法配置 IPv6 网络层规则${RESET}" >&2
+    fi
 
     echo -e "${CYAN}使用 iptables 配置防火墙规则...${RESET}"
 
@@ -670,10 +688,17 @@ setup_firewall_iptables() {
 
     # 创建自定义 chain
     execute_privileged iptables -N "${IPTABLES_CHAIN}" 2>/dev/null
+    if [ "${has_ip6tables}" = true ]; then
+        execute_privileged ip6tables -N "${IPTABLES_CHAIN}" 2>/dev/null
+    fi
 
     # 将针对目标端口的流量导向自定义 chain
     execute_privileged iptables -I INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}"
     execute_privileged iptables -I INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}"
+    if [ "${has_ip6tables}" = true ]; then
+        execute_privileged ip6tables -I INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}"
+        execute_privileged ip6tables -I INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}"
+    fi
 
     # 添加白名单 IP 的放行规则
     IFS=',' read -ra IPS <<< "${whitelist}"
@@ -681,13 +706,22 @@ setup_firewall_iptables() {
         ip=$(echo "${ip}" | xargs)
         [ -z "${ip}" ] && continue
         echo "  允许 ${ip} 访问端口 ${port}..."
-        execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p tcp --dport "${port}" -j ACCEPT
-        execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p udp --dport "${port}" -j ACCEPT
+        if [[ "${ip}" == *:* ]]; then
+            execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -s "${ip}" -p tcp --dport "${port}" -j ACCEPT
+            execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -s "${ip}" -p udp --dport "${port}" -j ACCEPT
+        else
+            execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p tcp --dport "${port}" -j ACCEPT
+            execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p udp --dport "${port}" -j ACCEPT
+        fi
     done
 
     # 拒绝其他所有到该端口的连接
     execute_privileged iptables -A "${IPTABLES_CHAIN}" -p tcp --dport "${port}" -j DROP
     execute_privileged iptables -A "${IPTABLES_CHAIN}" -p udp --dport "${port}" -j DROP
+    if [ "${has_ip6tables}" = true ]; then
+        execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -p tcp --dport "${port}" -j DROP
+        execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -p udp --dport "${port}" -j DROP
+    fi
 
     # 持久化 iptables 规则
     persist_iptables_rules
@@ -703,9 +737,15 @@ persist_iptables_rules() {
         # Debian/Ubuntu
         if [ -d /etc/iptables ]; then
             execute_privileged sh -c "iptables-save > /etc/iptables/rules.v4"
+            if command -v ip6tables-save &> /dev/null; then
+                execute_privileged sh -c "ip6tables-save > /etc/iptables/rules.v6"
+            fi
         # CentOS/RHEL
         elif [ -d /etc/sysconfig ]; then
             execute_privileged sh -c "iptables-save > /etc/sysconfig/iptables"
+            if command -v ip6tables-save &> /dev/null; then
+                execute_privileged sh -c "ip6tables-save > /etc/sysconfig/ip6tables"
+            fi
         fi
     fi
 }
@@ -799,14 +839,25 @@ remove_firewall_iptables() {
     if [ -n "${port}" ]; then
         execute_privileged iptables -D INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
         execute_privileged iptables -D INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
+        if command -v ip6tables &> /dev/null; then
+            execute_privileged ip6tables -D INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
+            execute_privileged ip6tables -D INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
+        fi
     else
         # 尝试通过 chain 名称查找并删除所有引用
         while execute_privileged iptables -D INPUT -j "${IPTABLES_CHAIN}" 2>/dev/null; do :; done
+        if command -v ip6tables &> /dev/null; then
+            while execute_privileged ip6tables -D INPUT -j "${IPTABLES_CHAIN}" 2>/dev/null; do :; done
+        fi
     fi
 
     # 清空并删除自定义 chain
     execute_privileged iptables -F "${IPTABLES_CHAIN}" 2>/dev/null
     execute_privileged iptables -X "${IPTABLES_CHAIN}" 2>/dev/null
+    if command -v ip6tables &> /dev/null; then
+        execute_privileged ip6tables -F "${IPTABLES_CHAIN}" 2>/dev/null
+        execute_privileged ip6tables -X "${IPTABLES_CHAIN}" 2>/dev/null
+    fi
 
     # 更新持久化规则
     persist_iptables_rules
