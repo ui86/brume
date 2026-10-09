@@ -2,6 +2,8 @@
 
 Brume 是用 Rust 实现的轻量级 SOCKS5 代理服务器，支持 TCP CONNECT、UDP ASSOCIATE、用户名密码认证和 IP/CIDR 白名单。
 
+项目同时提供 Rust 客户端库，可在其他 Rust 程序中建立 SOCKS5 TCP 连接或 UDP 关联。
+
 ## 功能
 
 - SOCKS5 无认证与用户名密码认证（RFC 1929）
@@ -52,6 +54,24 @@ bash install.sh
 
 未设置认证和白名单时，服务器会向所有来源开放。用户名密码认证按照 SOCKS5 标准以明文传输，公网使用时应在可信网络或加密隧道中部署。域名使用系统 DNS 解析器。
 
+## Rust 客户端库
+
+`brume::client::Client` 提供 `connect` 和 `associate` 方法。目标地址可使用 IP 或域名，例如：
+
+```rust
+use brume::client::Client;
+use brume::protocol::{Host, Target};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new("127.0.0.1:1080", "admin", "password123")?;
+    let target = Target { host: Host::Domain("example.com".into()), port: 443 };
+    let _stream = client.connect(target)?;
+    Ok(())
+}
+```
+
+`associate` 返回的关联对象会保持 TCP 控制连接存活；其 `send` 和 `recv` 方法负责封装及解析 SOCKS5 UDP 数据报。
+
 ## 验证
 
 ```bash
@@ -61,3 +81,7 @@ cargo test --locked --all-targets
 ```
 
 [重构分析与验证范围](docs/benchmark-comparison.md)
+
+## 许可
+
+MIT

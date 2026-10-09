@@ -103,7 +103,6 @@ impl Server {
         })
     }
 
-    #[cfg(test)]
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.tcp.local_addr()
     }

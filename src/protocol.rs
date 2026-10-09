@@ -40,6 +40,15 @@ impl Target {
     }
 }
 
+impl From<SocketAddr> for Target {
+    fn from(address: SocketAddr) -> Self {
+        Self {
+            host: Host::Ip(address.ip()),
+            port: address.port(),
+        }
+    }
+}
+
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -86,6 +95,21 @@ pub fn read_request(reader: &mut impl Read) -> io::Result<(u8, Target)> {
     Ok((header[1], read_target(reader, header[3])?))
 }
 
+pub fn write_request(writer: &mut impl Write, command: u8, target: &Target) -> io::Result<()> {
+    let mut bytes = vec![5, command, 0];
+    encode_target(&mut bytes, target)?;
+    writer.write_all(&bytes)
+}
+
+pub fn read_reply(reader: &mut impl Read) -> io::Result<(u8, Target)> {
+    let mut header = [0; 4];
+    reader.read_exact(&mut header)?;
+    if header[0] != 5 || header[2] != 0 {
+        return Err(invalid_data("SOCKS5 回复头无效"));
+    }
+    Ok((header[1], read_target(reader, header[3])?))
+}
+
 pub fn write_reply(writer: &mut impl Write, status: u8, address: SocketAddr) -> io::Result<()> {
     let mut bytes = vec![5, status, 0];
     encode_address(&mut bytes, address);
@@ -106,6 +130,25 @@ fn encode_address(bytes: &mut Vec<u8>, address: SocketAddr) {
     bytes.extend_from_slice(&address.port().to_be_bytes());
 }
 
+fn encode_target(bytes: &mut Vec<u8>, target: &Target) -> io::Result<()> {
+    match &target.host {
+        Host::Ip(ip) => encode_address(bytes, SocketAddr::new(*ip, target.port)),
+        Host::Domain(name) => {
+            if name.is_empty() || name.len() > 255 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "域名长度必须在 1 到 255 字节之间",
+                ));
+            }
+            bytes.push(3);
+            bytes.push(name.len() as u8);
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&target.port.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_datagram(bytes: &[u8]) -> io::Result<(Target, &[u8])> {
     if bytes.len() < 4 || bytes[..3] != [0, 0, 0] {
         return Err(invalid_data("UDP 数据报头无效或不支持分片"));
@@ -124,6 +167,14 @@ pub fn encode_datagram(address: SocketAddr, payload: &[u8]) -> Vec<u8> {
     encode_address(&mut bytes, address);
     bytes.extend_from_slice(payload);
     bytes
+}
+
+pub fn encode_datagram_to(target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(4 + 258 + payload.len());
+    bytes.extend_from_slice(&[0, 0, 0]);
+    encode_target(&mut bytes, target)?;
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -186,5 +237,31 @@ mod tests {
         ] {
             assert!(parse_datagram(packet).is_err());
         }
+    }
+
+    #[test]
+    fn client_request_and_reply_preserve_domain_target() {
+        let target = Target {
+            host: Host::Domain("example.com".into()),
+            port: 443,
+        };
+        let mut request = Vec::new();
+        write_request(&mut request, CONNECT, &target).unwrap();
+        assert_eq!(
+            read_request(&mut request.as_slice()).unwrap(),
+            (CONNECT, target.clone())
+        );
+
+        let mut reply = vec![5, SUCCESS, 0];
+        encode_target(&mut reply, &target).unwrap();
+        assert_eq!(
+            read_reply(&mut reply.as_slice()).unwrap(),
+            (SUCCESS, target.clone())
+        );
+        let packet = encode_datagram_to(&target, b"hello").unwrap();
+        assert_eq!(
+            parse_datagram(&packet).unwrap(),
+            (target, b"hello".as_slice())
+        );
     }
 }

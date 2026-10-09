@@ -10,6 +10,8 @@
 | SOCKS5 报文 | `src/protocol.rs`，解析请求、编码回复与 UDP 数据报 |
 | 代理服务 | `src/server.rs`，TCP 并发转发、UDP 关联和目标流管理 |
 | 程序入口 | `src/main.rs`，配置、信号处理与服务启动 |
+| SOCKS5 客户端 | `src/client.rs`，TCP 连接、认证和 UDP 关联封装 |
+| Rust 库入口 | `src/lib.rs`，导出客户端与协议模块 |
 | 发布 | GitHub Actions 构建 Linux amd64/arm64 静态链接程序并保留安装包命名 |
 
 ## 行为差异
@@ -18,10 +20,10 @@
 - 无效的白名单条目现在会导致启动失败，避免拼写错误意外放宽访问范围。
 - 用户名与密码必须同时指定；旧实现缺少其中一项时会退回无认证模式。
 - 域名解析使用系统 DNS 配置，不再强制使用公共 DNS 服务器。
-- Go 包中的客户端库不再作为项目产物提供。本项目现以 SOCKS5 服务端二进制程序为对外接口。
+- Go 包中的客户端接口已迁移为 Rust 公共库。Rust API 与原 Go API 的命名不同，网络功能继续覆盖 TCP 与 UDP。
 
 ## 验证范围
 
-Rust 测试覆盖协议 IPv4、IPv6、域名报文解析、UDP 数据报合法性、白名单、旧版命令行参数、认证、TCP 半关闭转发、UDP 关联限制及目标回复。CI 在 Linux 上执行格式检查、Clippy 和测试，Release 在 amd64 与 arm64 上分别构建。
+Rust 测试覆盖协议 IPv4、IPv6、域名报文解析、UDP 数据报合法性、白名单、旧版命令行参数、认证、TCP 半关闭转发、UDP 关联限制、目标回复及客户端库端到端使用。CI 在 Linux 上执行格式检查、Clippy 和测试，Release 在 amd64 与 arm64 上分别构建。
 
 原 Go 微基准仅能说明旧实现的性能，不能作为 Rust 版本的性能结果。Rust 版本尚未完成 Linux 生产环境吞吐和延迟压测。

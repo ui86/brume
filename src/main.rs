@@ -1,9 +1,5 @@
-mod config;
-mod protocol;
-mod server;
-
-use config::Config;
-use server::Server;
+use brume::config::Config;
+use brume::server::Server;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
