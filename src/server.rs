@@ -10,11 +10,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_BUFFER_SIZE: usize = 65_535;
+const MAX_TCP_CLIENTS: usize = 2048;
+const MAX_UDP_PACKET_TASKS: usize = 256;
 
 type Associations = Arc<Mutex<HashMap<u64, Arc<Association>>>>;
 
@@ -136,6 +138,7 @@ impl Server {
 
         let udp_task =
             tokio::spawn(async move { udp_loop(relay, associations, config, dns, shutdown).await });
+        let client_slots = Arc::new(Semaphore::new(MAX_TCP_CLIENTS));
 
         let mut result = Ok(());
         loop {
@@ -147,6 +150,9 @@ impl Server {
                             if !self.config.whitelist.allows(address.ip()) {
                                 continue;
                             }
+                            let Ok(permit) = Arc::clone(&client_slots).try_acquire_owned() else {
+                                continue;
+                            };
                             let config = Arc::clone(&self.config);
                             let dns = Arc::clone(&self.dns);
                             let associations = Arc::clone(&self.associations);
@@ -154,6 +160,7 @@ impl Server {
                             let shutdown = self.shutdown.clone();
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 if let Err(error) =
                                     handle_client(stream, config, dns, udp, associations, id, shutdown).await
                                     && !matches!(
@@ -481,6 +488,7 @@ async fn udp_loop(
     shutdown: CancellationToken,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
+    let packet_slots = Arc::new(Semaphore::new(MAX_UDP_PACKET_TASKS));
     loop {
         let (length, source) = tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -525,12 +533,16 @@ async fn udp_loop(
         let Some(association) = association else {
             continue;
         };
+        let Ok(permit) = Arc::clone(&packet_slots).try_acquire_owned() else {
+            continue;
+        };
 
         let relay = Arc::clone(&udp);
         let config = Arc::clone(&config);
         let dns = Arc::clone(&dns);
         let payload = payload.to_vec();
         tokio::spawn(async move {
+            let _permit = permit;
             handle_udp_packet(&relay, &association, &config, &dns, target, payload).await;
         });
     }
