@@ -217,11 +217,10 @@ mod tests {
     use crate::config::{Config, Whitelist};
     use crate::server::Server;
     use std::net::{TcpListener, UdpSocket};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
+    use tokio_util::sync::CancellationToken;
 
-    fn start_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<io::Result<()>>) {
+    fn start_server() -> (String, CancellationToken, thread::JoinHandle<io::Result<()>>) {
         let config = Config {
             port: 0,
             username: "admin".into(),
@@ -231,8 +230,8 @@ mod tests {
             udp_timeout: Duration::from_secs(3),
             dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
         };
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = Server::bind(config, Arc::clone(&shutdown)).unwrap();
+        let shutdown = CancellationToken::new();
+        let server = Server::bind(config, shutdown.clone()).unwrap();
         let address = format!("127.0.0.1:{}", server.local_addr().unwrap().port());
         let handle = thread::spawn(move || server.run());
         (address, shutdown, handle)
@@ -259,7 +258,7 @@ mod tests {
         stream.read_exact(&mut response).unwrap();
         assert_eq!(&response, b"hello");
         echo_thread.join().unwrap();
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }
 
@@ -291,7 +290,7 @@ mod tests {
         }
         echo_thread.join().unwrap();
         drop(association);
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }
 

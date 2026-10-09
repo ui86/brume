@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_BUFFER_SIZE: usize = 65_535;
@@ -61,24 +62,18 @@ fn normalize(ip: IpAddr) -> IpAddr {
     }
 }
 
-async fn check_shutdown(flag: &AtomicBool) {
-    while !flag.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 pub struct Server {
     config: Arc<Config>,
     dns: Arc<DnsResolver>,
     tcp: std::net::TcpListener,
-    udp: Arc<std::net::UdpSocket>,
+    udp: std::net::UdpSocket,
     associations: Associations,
     next_id: AtomicU64,
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 }
 
 impl Server {
-    pub fn bind(config: Config, shutdown: Arc<AtomicBool>) -> io::Result<Self> {
+    pub fn bind(config: Config, shutdown: CancellationToken) -> io::Result<Self> {
         let dns = Arc::new(DnsResolver::new(&config.dns_servers)?);
         let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.port);
         let tcp_socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
@@ -93,7 +88,7 @@ impl Server {
         let udp_address =
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), tcp.local_addr()?.port());
         udp_socket.bind(&udp_address.into())?;
-        let udp = Arc::new(std::net::UdpSocket::from(udp_socket));
+        let udp = std::net::UdpSocket::from(udp_socket);
         Ok(Self {
             config: Arc::new(config),
             dns,
@@ -122,11 +117,12 @@ impl Server {
 
     pub async fn run_async(self) -> io::Result<()> {
         let tcp = tokio::net::TcpListener::from_std(self.tcp)?;
-        let udp = Arc::new(tokio::net::UdpSocket::from_std((*self.udp).try_clone()?)?);
+        // 直接消费 self.udp 转为 tokio 套接字，避免 try_clone 产生冗余句柄
+        let udp = Arc::new(tokio::net::UdpSocket::from_std(self.udp)?);
 
         let relay = Arc::clone(&udp);
         let associations = Arc::clone(&self.associations);
-        let shutdown = Arc::clone(&self.shutdown);
+        let shutdown = self.shutdown.clone();
         let config = Arc::clone(&self.config);
         let dns = Arc::clone(&self.dns);
 
@@ -135,15 +131,12 @@ impl Server {
         });
 
         let mut result = Ok(());
-        while !self.shutdown.load(Ordering::Relaxed) {
+        loop {
             tokio::select! {
-                _ = check_shutdown(&self.shutdown) => break,
+                _ = self.shutdown.cancelled() => break,
                 accept_res = tcp.accept() => {
                     match accept_res {
                         Ok((stream, address)) => {
-                            if self.shutdown.load(Ordering::Relaxed) {
-                                break;
-                            }
                             if !self.config.whitelist.allows(address.ip()) {
                                 continue;
                             }
@@ -151,7 +144,7 @@ impl Server {
                             let dns = Arc::clone(&self.dns);
                             let associations = Arc::clone(&self.associations);
                             let udp = Arc::clone(&udp);
-                            let shutdown = Arc::clone(&self.shutdown);
+                            let shutdown = self.shutdown.clone();
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
                                 if let Err(error) =
@@ -174,7 +167,8 @@ impl Server {
             }
         }
 
-        self.shutdown.store(true, Ordering::Relaxed);
+        // 通知所有子任务停止
+        self.shutdown.cancel();
         for association in self.associations.lock().unwrap().values() {
             association.alive.store(false, Ordering::Relaxed);
         }
@@ -262,7 +256,7 @@ async fn handle_client(
     udp: Arc<tokio::net::UdpSocket>,
     associations: Associations,
     id: u64,
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 ) -> io::Result<()> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiate(&mut stream, &config))
         .await
@@ -392,7 +386,7 @@ async fn associate(
     udp: Arc<tokio::net::UdpSocket>,
     associations: Associations,
     id: u64,
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 ) -> io::Result<()> {
     let peer = stream.peer_addr()?;
     match target.host {
@@ -435,9 +429,9 @@ async fn associate(
         return Err(error);
     }
     let mut buffer = [0u8; 1024];
-    while !shutdown.load(Ordering::Relaxed) {
+    loop {
         tokio::select! {
-            _ = check_shutdown(&shutdown) => break,
+            _ = shutdown.cancelled() => break,
             res = stream.read(&mut buffer) => {
                 match res {
                     Ok(0) | Err(_) => break,
@@ -456,12 +450,12 @@ async fn udp_loop(
     associations: Associations,
     config: Arc<Config>,
     dns: Arc<DnsResolver>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
-    while !shutdown.load(Ordering::Relaxed) {
+    loop {
         let (length, source) = tokio::select! {
-            _ = check_shutdown(&shutdown) => break,
+            _ = shutdown.cancelled() => break,
             res = udp.recv_from(&mut buffer) => {
                 match res {
                     Ok(val) => val,
@@ -634,7 +628,7 @@ mod tests {
         whitelist: &str,
     ) -> (
         SocketAddr,
-        Arc<AtomicBool>,
+        CancellationToken,
         thread::JoinHandle<io::Result<()>>,
     ) {
         let config = Config {
@@ -646,8 +640,8 @@ mod tests {
             udp_timeout: Duration::from_secs(3),
             dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
         };
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = Server::bind(config, Arc::clone(&shutdown)).unwrap();
+        let shutdown = CancellationToken::new();
+        let server = Server::bind(config, shutdown.clone()).unwrap();
         let address = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             server.local_addr().unwrap().port(),
@@ -708,7 +702,7 @@ mod tests {
         client.read_to_end(&mut response).unwrap();
         assert_eq!(response, b"brume");
         echo_thread.join().unwrap();
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }
 
@@ -721,7 +715,7 @@ mod tests {
             .unwrap();
         assert!(denied.write_all(&[5, 1, 2]).is_ok());
         assert!(matches!(denied.read(&mut [0; 2]), Ok(0) | Err(_)));
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.cancel();
         server_thread.join().unwrap().unwrap();
 
         let (proxy, shutdown, server_thread) = start_server("admin", "secret", "127.0.0.1");
@@ -757,7 +751,7 @@ mod tests {
             request(&mut client, 2, "0.0.0.0:0".parse().unwrap())[1],
             protocol::COMMAND_UNSUPPORTED
         );
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }
 
@@ -770,7 +764,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         assert_eq!(negotiate_client(&mut client, 0), [5, 0]);
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }
 
@@ -833,7 +827,7 @@ mod tests {
         probe_sender.send(()).unwrap();
         client_udp.send_to(&packet, relay).unwrap();
         assert!(remote_thread.join().unwrap());
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }
 
@@ -899,7 +893,7 @@ mod tests {
         );
         echo.join().unwrap();
         drop(control);
-        shutdown.store(true, Ordering::Relaxed);
+        shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }
 }
