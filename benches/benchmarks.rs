@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 const SAMPLES: usize = 5;
 
@@ -103,7 +104,7 @@ fn udp_roundtrip_benchmark() {
         }
     });
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = CancellationToken::new();
     let config = Config {
         port: 0,
         username: String::new(),
@@ -113,7 +114,7 @@ fn udp_roundtrip_benchmark() {
         udp_timeout: Duration::from_secs(60),
         dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
     };
-    let server = Server::bind(config, Arc::clone(&shutdown)).unwrap();
+    let server = Server::bind(config, shutdown.clone()).unwrap();
     let server_addr = SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         server.local_addr().unwrap().port(),
@@ -141,7 +142,7 @@ fn udp_roundtrip_benchmark() {
         }
     });
     drop(association);
-    shutdown.store(true, Ordering::Relaxed);
+    shutdown.cancel();
     remote_shutdown.store(true, Ordering::Relaxed);
     server_thread.join().unwrap();
     echo.join().unwrap();
@@ -181,7 +182,7 @@ fn tcp_benchmarks() {
         }
     });
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = CancellationToken::new();
     let config = Config {
         port: 0,
         username: String::new(),
@@ -191,7 +192,7 @@ fn tcp_benchmarks() {
         udp_timeout: Duration::from_secs(60),
         dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
     };
-    let server = Server::bind(config, Arc::clone(&shutdown)).unwrap();
+    let server = Server::bind(config, shutdown.clone()).unwrap();
     let address = SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         server.local_addr().unwrap().port(),
@@ -237,7 +238,7 @@ fn tcp_benchmarks() {
     });
     drop(upload);
     sink_thread.join().unwrap();
-    shutdown.store(true, Ordering::Relaxed);
+    shutdown.cancel();
     echo_shutdown.store(true, Ordering::Relaxed);
     server_thread.join().unwrap();
     echo.join().unwrap();

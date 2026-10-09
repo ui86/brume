@@ -48,10 +48,7 @@ pub async fn happy_eyeballs_connect(
     total_timeout: Duration,
 ) -> io::Result<TcpStream> {
     if addresses.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "目标地址列表为空",
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, "目标地址列表为空"));
     }
 
     // 单个地址快速通道

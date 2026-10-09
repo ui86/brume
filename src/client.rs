@@ -220,7 +220,11 @@ mod tests {
     use std::thread;
     use tokio_util::sync::CancellationToken;
 
-    fn start_server() -> (String, CancellationToken, thread::JoinHandle<io::Result<()>>) {
+    fn start_server() -> (
+        String,
+        CancellationToken,
+        thread::JoinHandle<io::Result<()>>,
+    ) {
         let config = Config {
             port: 0,
             username: "admin".into(),

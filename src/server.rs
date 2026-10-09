@@ -126,9 +126,8 @@ impl Server {
         let config = Arc::clone(&self.config);
         let dns = Arc::clone(&self.dns);
 
-        let udp_task = tokio::spawn(async move {
-            udp_loop(relay, associations, config, dns, shutdown).await
-        });
+        let udp_task =
+            tokio::spawn(async move { udp_loop(relay, associations, config, dns, shutdown).await });
 
         let mut result = Ok(());
         loop {
@@ -262,37 +261,32 @@ async fn handle_client(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 协商超时"))??;
 
-    let (command, target) = match tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        protocol::read_request_async(&mut stream),
-    )
-    .await
-    {
-        Ok(Ok(request)) => request,
-        Ok(Err(error)) => {
-            if error.kind() == io::ErrorKind::InvalidData {
-                let address = unspecified(stream.local_addr()?.ip());
-                let _ = protocol::write_reply_async(
-                    &mut stream,
-                    protocol::ADDRESS_UNSUPPORTED,
-                    address,
-                )
-                .await;
+    let (command, target) =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, protocol::read_request_async(&mut stream))
+            .await
+        {
+            Ok(Ok(request)) => request,
+            Ok(Err(error)) => {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    let address = unspecified(stream.local_addr()?.ip());
+                    let _ = protocol::write_reply_async(
+                        &mut stream,
+                        protocol::ADDRESS_UNSUPPORTED,
+                        address,
+                    )
+                    .await;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-        Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "读取请求超时")),
-    };
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "读取请求超时")),
+        };
 
     match command {
         protocol::CONNECT => connect(stream, target, config.tcp_timeout, &dns).await,
-        protocol::UDP_ASSOCIATE => {
-            associate(stream, target, udp, associations, id, shutdown).await
-        }
+        protocol::UDP_ASSOCIATE => associate(stream, target, udp, associations, id, shutdown).await,
         _ => {
             let address = unspecified(stream.local_addr()?.ip());
-            protocol::write_reply_async(&mut stream, protocol::COMMAND_UNSUPPORTED, address)
-                .await
+            protocol::write_reply_async(&mut stream, protocol::COMMAND_UNSUPPORTED, address).await
         }
     }
 }
@@ -336,11 +330,9 @@ async fn forward_bidirectional(
     timeout: Option<Duration>,
 ) -> io::Result<()> {
     match timeout {
-        None => {
-            tokio::io::copy_bidirectional_with_sizes(client, remote, 65536, 65536)
-                .await
-                .map(|_| ())
-        }
+        None => tokio::io::copy_bidirectional_with_sizes(client, remote, 65536, 65536)
+            .await
+            .map(|_| ()),
         Some(idle_timeout) => {
             let (mut client_r, mut client_w) = client.split();
             let (mut remote_r, mut remote_w) = remote.split();
@@ -400,7 +392,8 @@ async fn associate(
         }
         Host::Domain(_) => {
             let address = unspecified(stream.local_addr()?.ip());
-            protocol::write_reply_async(&mut stream, protocol::ADDRESS_UNSUPPORTED, address).await?;
+            protocol::write_reply_async(&mut stream, protocol::ADDRESS_UNSUPPORTED, address)
+                .await?;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "UDP 客户端地址必须是 IP",
@@ -484,13 +477,11 @@ async fn udp_loop(
             let map = associations.lock().unwrap();
             map.values()
                 .find(|association| {
-                    association.alive.load(Ordering::Relaxed)
-                        && association.is_bound_to(source)
+                    association.alive.load(Ordering::Relaxed) && association.is_bound_to(source)
                 })
                 .or_else(|| {
                     map.values().find(|association| {
-                        association.alive.load(Ordering::Relaxed)
-                            && association.accepts(source)
+                        association.alive.load(Ordering::Relaxed) && association.accepts(source)
                     })
                 })
                 .cloned()
@@ -608,7 +599,10 @@ async fn receive_remote(
     }
 
     let mut flows = association.flows.lock().unwrap();
-    if flows.get(&target).is_some_and(|current| Arc::ptr_eq(current, &flow)) {
+    if flows
+        .get(&target)
+        .is_some_and(|current| Arc::ptr_eq(current, &flow))
+    {
         flows.remove(&target);
     }
 }
