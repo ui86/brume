@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -351,19 +352,36 @@ async fn forward_bidirectional(
         Some(idle_timeout) => {
             let (mut client_r, mut client_w) = client.split();
             let (mut remote_r, mut remote_w) = remote.split();
+            let (activity, mut activity_rx) = watch::channel(tokio::time::Instant::now());
+            let c2r = copy_direction(&mut client_r, &mut remote_w, &activity);
+            let r2c = copy_direction(&mut remote_r, &mut client_w, &activity);
+            let transfer = async { tokio::try_join!(c2r, r2c).map(|_| ()) };
+            tokio::pin!(transfer);
 
-            let c2r = copy_direction_idle(&mut client_r, &mut remote_w, idle_timeout);
-            let r2c = copy_direction_idle(&mut remote_r, &mut client_w, idle_timeout);
-
-            tokio::try_join!(c2r, r2c).map(|_| ())
+            loop {
+                let deadline = *activity_rx.borrow_and_update() + idle_timeout;
+                tokio::select! {
+                    result = &mut transfer => return result,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if tokio::time::Instant::now().duration_since(*activity_rx.borrow()) >= idle_timeout {
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP 连接空闲超时"));
+                        }
+                    }
+                    changed = activity_rx.changed() => {
+                        if changed.is_err() {
+                            return Err(io::Error::other("TCP 转发任务已停止"));
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
-async fn copy_direction_idle<R, W>(
+async fn copy_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
-    timeout: Duration,
+    activity: &watch::Sender<tokio::time::Instant>,
 ) -> io::Result<u64>
 where
     R: AsyncReadExt + Unpin,
@@ -372,16 +390,13 @@ where
     let mut buffer = vec![0u8; 65536];
     let mut total = 0u64;
     loop {
-        let n = match tokio::time::timeout(timeout, reader.read(&mut buffer)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP 连接空闲超时")),
-        };
+        let n = reader.read(&mut buffer).await?;
         if n == 0 {
             writer.shutdown().await?;
             break;
         }
         writer.write_all(&buffer[..n]).await?;
+        activity.send_replace(tokio::time::Instant::now());
         total += n as u64;
     }
     Ok(total)
@@ -640,12 +655,25 @@ mod tests {
         CancellationToken,
         thread::JoinHandle<io::Result<()>>,
     ) {
+        start_server_with_timeout(username, password, whitelist, None)
+    }
+
+    fn start_server_with_timeout(
+        username: &str,
+        password: &str,
+        whitelist: &str,
+        tcp_timeout: Option<Duration>,
+    ) -> (
+        SocketAddr,
+        CancellationToken,
+        thread::JoinHandle<io::Result<()>>,
+    ) {
         let config = Config {
             port: 0,
             username: username.into(),
             password: password.into(),
             whitelist: Whitelist::parse(whitelist).unwrap(),
-            tcp_timeout: None,
+            tcp_timeout,
             udp_timeout: Duration::from_secs(3),
             dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
         };
@@ -711,6 +739,36 @@ mod tests {
         client.read_to_end(&mut response).unwrap();
         assert_eq!(response, b"brume");
         echo_thread.join().unwrap();
+        shutdown.cancel();
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn one_way_tcp_transfer_keeps_idle_connection_alive() {
+        let remote = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = remote.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let (mut stream, _) = remote.accept().unwrap();
+            for _ in 0..12 {
+                stream.write_all(b"x").unwrap();
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let (proxy, shutdown, server_thread) =
+            start_server_with_timeout("", "", "127.0.0.1", Some(Duration::from_millis(250)));
+        let mut client = TcpStream::connect(proxy).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(negotiate_client(&mut client, 0), [5, 0]);
+        assert_eq!(
+            request(&mut client, protocol::CONNECT, destination)[1],
+            protocol::SUCCESS
+        );
+        let mut payload = [0; 12];
+        client.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"xxxxxxxxxxxx");
+        sender.join().unwrap();
         shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }
