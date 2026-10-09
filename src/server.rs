@@ -10,13 +10,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_BUFFER_SIZE: usize = 65_535;
 const MAX_TCP_CLIENTS: usize = 2048;
 const MAX_UDP_PACKET_TASKS: usize = 256;
+const MAX_UDP_FLOWS: usize = 1024;
+const MAX_FLOWS_PER_ASSOCIATION: usize = 128;
 
 type Associations = Arc<Mutex<HashMap<u64, Arc<Association>>>>;
 
@@ -26,7 +28,7 @@ struct Association {
     endpoint: Mutex<Option<SocketAddr>>,
     alive: AtomicBool,
     stopped: CancellationToken,
-    flows: Mutex<HashMap<Target, Arc<Flow>>>,
+    flows: Mutex<HashMap<Target, Arc<FlowSlot>>>,
 }
 
 impl Association {
@@ -54,6 +56,12 @@ impl Association {
 struct Flow {
     socket: Arc<tokio::net::UdpSocket>,
     last_activity: Mutex<Instant>,
+    active: AtomicBool,
+}
+
+struct FlowSlot {
+    flow: OnceCell<Option<Arc<Flow>>>,
+    _permit: OwnedSemaphorePermit,
 }
 
 fn normalize(ip: IpAddr) -> IpAddr {
@@ -489,6 +497,7 @@ async fn udp_loop(
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
     let packet_slots = Arc::new(Semaphore::new(MAX_UDP_PACKET_TASKS));
+    let flow_slots = Arc::new(Semaphore::new(MAX_UDP_FLOWS));
     loop {
         let (length, source) = tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -540,10 +549,20 @@ async fn udp_loop(
         let relay = Arc::clone(&udp);
         let config = Arc::clone(&config);
         let dns = Arc::clone(&dns);
+        let flow_slots = Arc::clone(&flow_slots);
         let payload = payload.to_vec();
         tokio::spawn(async move {
             let _permit = permit;
-            handle_udp_packet(&relay, &association, &config, &dns, target, payload).await;
+            handle_udp_packet(
+                &relay,
+                &association,
+                &config,
+                &dns,
+                &flow_slots,
+                target,
+                payload,
+            )
+            .await;
         });
     }
     Ok(())
@@ -554,6 +573,7 @@ async fn handle_udp_packet(
     association: &Arc<Association>,
     config: &Config,
     dns: &DnsResolver,
+    flow_slots: &Arc<Semaphore>,
     target: Target,
     payload: Vec<u8>,
 ) {
@@ -561,58 +581,93 @@ async fn handle_udp_packet(
         return;
     }
 
-    let existing = {
-        let flows = association.flows.lock().unwrap();
-        flows.get(&target).cloned()
-    };
-
-    let flow = if let Some(flow) = existing {
-        flow
-    } else {
-        let Ok(addresses) = dns.lookup(&target).await else {
+    for _ in 0..2 {
+        let slot = {
+            let mut flows = association.flows.lock().unwrap();
+            if let Some(slot) = flows.get(&target) {
+                Arc::clone(slot)
+            } else {
+                if flows.len() >= MAX_FLOWS_PER_ASSOCIATION {
+                    return;
+                }
+                let Ok(permit) = Arc::clone(flow_slots).try_acquire_owned() else {
+                    return;
+                };
+                let slot = Arc::new(FlowSlot {
+                    flow: OnceCell::new(),
+                    _permit: permit,
+                });
+                flows.insert(target.clone(), Arc::clone(&slot));
+                slot
+            }
+        };
+        let flow = slot
+            .flow
+            .get_or_init(|| async {
+                let addresses = dns.lookup(&target).await.ok()?;
+                let destination = addresses[0];
+                let std_socket = std::net::UdpSocket::bind(unspecified(destination.ip())).ok()?;
+                std_socket.connect(destination).ok()?;
+                std_socket.set_nonblocking(true).ok()?;
+                let socket = tokio::net::UdpSocket::from_std(std_socket).ok()?;
+                let flow = Arc::new(Flow {
+                    socket: Arc::new(socket),
+                    last_activity: Mutex::new(Instant::now()),
+                    active: AtomicBool::new(true),
+                });
+                let worker = Arc::clone(&flow);
+                let association = Arc::clone(association);
+                let relay = Arc::clone(udp);
+                let slot = Arc::clone(&slot);
+                let target = target.clone();
+                let timeout = config.udp_timeout;
+                tokio::spawn(async move {
+                    receive_remote(
+                        worker,
+                        slot,
+                        relay,
+                        association,
+                        target,
+                        destination,
+                        timeout,
+                    )
+                    .await;
+                });
+                Some(flow)
+            })
+            .await;
+        let Some(flow) = flow else {
+            remove_flow_slot(association, &target, &slot);
             return;
         };
-        let destination = addresses[0];
-        let Ok(std_socket) = std::net::UdpSocket::bind(unspecified(destination.ip())) else {
-            return;
-        };
-        if std_socket.connect(destination).is_err() {
+        if !flow.active.load(Ordering::Relaxed) {
+            remove_flow_slot(association, &target, &slot);
+            continue;
+        }
+        if !association.alive.load(Ordering::Relaxed) {
             return;
         }
-        std_socket.set_nonblocking(true).ok();
-        let Ok(socket) = tokio::net::UdpSocket::from_std(std_socket) else {
-            return;
-        };
-        let socket = Arc::new(socket);
-        let candidate = Arc::new(Flow {
-            socket,
-            last_activity: Mutex::new(Instant::now()),
-        });
-
-        let mut flows = association.flows.lock().unwrap();
-        if let Some(flow) = flows.get(&target) {
-            Arc::clone(flow)
-        } else {
-            flows.insert(target.clone(), Arc::clone(&candidate));
-            let association = Arc::clone(association);
-            let relay = Arc::clone(udp);
-            let worker = Arc::clone(&candidate);
-            let timeout = config.udp_timeout;
-            tokio::spawn(async move {
-                receive_remote(worker, relay, association, target, destination, timeout).await;
-            });
-            candidate
-        }
-    };
-
-    *flow.last_activity.lock().unwrap() = Instant::now();
-    if flow.socket.send(&payload).await.is_ok() {
         *flow.last_activity.lock().unwrap() = Instant::now();
+        if flow.socket.send(&payload).await.is_ok() {
+            *flow.last_activity.lock().unwrap() = Instant::now();
+        }
+        return;
+    }
+}
+
+fn remove_flow_slot(association: &Association, target: &Target, slot: &Arc<FlowSlot>) {
+    let mut flows = association.flows.lock().unwrap();
+    if flows
+        .get(target)
+        .is_some_and(|current| Arc::ptr_eq(current, slot))
+    {
+        flows.remove(target);
     }
 }
 
 async fn receive_remote(
     flow: Arc<Flow>,
+    slot: Arc<FlowSlot>,
     relay: Arc<tokio::net::UdpSocket>,
     association: Arc<Association>,
     target: Target,
@@ -661,13 +716,8 @@ async fn receive_remote(
         }
     }
 
-    let mut flows = association.flows.lock().unwrap();
-    if flows
-        .get(&target)
-        .is_some_and(|current| Arc::ptr_eq(current, &flow))
-    {
-        flows.remove(&target);
-    }
+    flow.active.store(false, Ordering::Relaxed);
+    remove_flow_slot(&association, &target, &slot);
 }
 
 #[cfg(test)]
@@ -760,15 +810,22 @@ mod tests {
         let flow = Arc::new(Flow {
             socket: Arc::new(socket),
             last_activity: Mutex::new(Instant::now()),
+            active: AtomicBool::new(true),
         });
         let target = Target::from(destination);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let slot = Arc::new(FlowSlot {
+            flow: OnceCell::new(),
+            _permit: permit,
+        });
+        assert!(slot.flow.set(Some(Arc::clone(&flow))).is_ok());
         let association = Arc::new(Association {
             client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             requested_port: 0,
             endpoint: Mutex::new(None),
             alive: AtomicBool::new(true),
             stopped: CancellationToken::new(),
-            flows: Mutex::new(HashMap::from([(target.clone(), Arc::clone(&flow))])),
+            flows: Mutex::new(HashMap::from([(target.clone(), slot)])),
         });
         let relay = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         (association, flow, relay, target, destination)
@@ -777,8 +834,10 @@ mod tests {
     #[tokio::test]
     async fn closed_udp_association_stops_unlimited_flow() {
         let (association, flow, relay, target, destination) = test_udp_flow().await;
+        let slot = Arc::clone(association.flows.lock().unwrap().get(&target).unwrap());
         let task = tokio::spawn(receive_remote(
             Arc::clone(&flow),
+            slot,
             relay,
             Arc::clone(&association),
             target,
@@ -798,8 +857,10 @@ mod tests {
     #[tokio::test]
     async fn outgoing_udp_activity_extends_flow_lifetime() {
         let (association, flow, relay, target, destination) = test_udp_flow().await;
+        let slot = Arc::clone(association.flows.lock().unwrap().get(&target).unwrap());
         let task = tokio::spawn(receive_remote(
             Arc::clone(&flow),
+            slot,
             relay,
             Arc::clone(&association),
             target,
