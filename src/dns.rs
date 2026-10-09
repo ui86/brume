@@ -10,16 +10,12 @@ use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 
 pub struct DnsResolver {
-    runtime: Runtime,
+    runtime: Option<Runtime>,
     resolver: TokioResolver,
 }
 
 impl DnsResolver {
     pub fn new(servers: &[SocketAddr]) -> io::Result<Self> {
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
         let nameservers = servers
             .iter()
             .map(|server| {
@@ -38,16 +34,35 @@ impl DnsResolver {
         opts.timeout = Duration::from_secs(3);
         opts.attempts = 2;
         opts.use_hosts_file = ResolveHosts::Never;
-        let resolver = builder.build().map_err(io::Error::other)?;
+
+        let (runtime, resolver) = match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let resolver = builder.build().map_err(io::Error::other)?;
+                (None, resolver)
+            }
+            Err(_) => {
+                let rt = Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()?;
+                let resolver = {
+                    let _guard = rt.enter();
+                    builder.build().map_err(io::Error::other)?
+                };
+                (Some(rt), resolver)
+            }
+        };
         Ok(Self { runtime, resolver })
     }
 
-    pub fn lookup(&self, target: &Target) -> io::Result<Vec<SocketAddr>> {
+    /// 异步解析目标地址
+    pub async fn lookup(&self, target: &Target) -> io::Result<Vec<SocketAddr>> {
         let addresses: Vec<_> = match &target.host {
             Host::Ip(ip) => vec![SocketAddr::new(*ip, target.port)],
             Host::Domain(name) => self
-                .runtime
-                .block_on(self.resolver.lookup_ip(name.as_str()))
+                .resolver
+                .lookup_ip(name.as_str())
+                .await
                 .map_err(io::Error::other)?
                 .iter()
                 .map(|ip| SocketAddr::new(ip, target.port))
@@ -60,6 +75,28 @@ impl DnsResolver {
             ));
         }
         Ok(addresses)
+    }
+
+    /// 同步阻塞解析目标地址（用于测试及外部同步兼容）
+    pub fn lookup_blocking(&self, target: &Target) -> io::Result<Vec<SocketAddr>> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(self.lookup(target)))
+        } else if let Some(ref rt) = self.runtime {
+            rt.block_on(self.lookup(target))
+        } else {
+            let rt = Builder::new_current_thread().enable_all().build()?;
+            rt.block_on(self.lookup(target))
+        }
+    }
+}
+
+impl Drop for DnsResolver {
+    fn drop(&mut self) {
+        if let Some(rt) = self.runtime.take() {
+            // 将自建的 Tokio 运行时移至独立的系统线程中释放，
+            // 避免在当前处于 Tokio 异步工作线程或 block_on 上下文时触发不可阻塞清理 panic
+            let _ = std::thread::spawn(move || drop(rt)).join();
+        }
     }
 }
 
@@ -98,8 +135,8 @@ mod tests {
         Some(response)
     }
 
-    #[test]
-    fn custom_server_resolves_domain_without_system_dns() {
+    #[tokio::test]
+    async fn custom_server_resolves_domain_without_system_dns() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
@@ -125,7 +162,7 @@ mod tests {
             host: Host::Domain("brume-test.example.com.".into()),
             port: 443,
         };
-        let result = resolver.lookup(&target).unwrap();
+        let result = resolver.lookup(&target).await.unwrap();
         assert!(result.contains(&"127.0.0.42:443".parse().unwrap()));
         thread::sleep(Duration::from_millis(50));
         let first_queries = queries.load(Ordering::Relaxed);
@@ -133,6 +170,7 @@ mod tests {
         assert!(
             resolver
                 .lookup(&target)
+                .await
                 .unwrap()
                 .contains(&"127.0.0.42:443".parse().unwrap())
         );

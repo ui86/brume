@@ -116,6 +116,84 @@ pub fn write_reply(writer: &mut impl Write, status: u8, address: SocketAddr) -> 
     writer.write_all(&bytes)
 }
 
+async fn read_target_async<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+    atyp: u8,
+) -> io::Result<Target> {
+    let host = match atyp {
+        1 => {
+            let mut octets = [0; 4];
+            reader.read_exact(&mut octets).await?;
+            Host::Ip(IpAddr::V4(Ipv4Addr::from(octets)))
+        }
+        3 => {
+            let mut length = [0];
+            reader.read_exact(&mut length).await?;
+            if length[0] == 0 {
+                return Err(invalid_data("域名不能为空"));
+            }
+            let mut name = vec![0; usize::from(length[0])];
+            reader.read_exact(&mut name).await?;
+            let name = String::from_utf8(name).map_err(|_| invalid_data("域名编码无效"))?;
+            Host::Domain(name)
+        }
+        4 => {
+            let mut octets = [0; 16];
+            reader.read_exact(&mut octets).await?;
+            Host::Ip(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => return Err(invalid_data("不支持的地址类型")),
+    };
+    let mut port = [0; 2];
+    reader.read_exact(&mut port).await?;
+    Ok(Target {
+        host,
+        port: u16::from_be_bytes(port),
+    })
+}
+
+pub async fn read_request_async<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<(u8, Target)> {
+    let mut header = [0; 4];
+    reader.read_exact(&mut header).await?;
+    if header[0] != 5 || header[2] != 0 {
+        return Err(invalid_data("SOCKS5 请求头无效"));
+    }
+    Ok((header[1], read_target_async(reader, header[3]).await?))
+}
+
+pub async fn write_request_async<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    command: u8,
+    target: &Target,
+) -> io::Result<()> {
+    let mut bytes = vec![5, command, 0];
+    encode_target(&mut bytes, target)?;
+    writer.write_all(&bytes).await
+}
+
+pub async fn read_reply_async<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<(u8, Target)> {
+    let mut header = [0; 4];
+    reader.read_exact(&mut header).await?;
+    if header[0] != 5 || header[2] != 0 {
+        return Err(invalid_data("SOCKS5 回复头无效"));
+    }
+    Ok((header[1], read_target_async(reader, header[3]).await?))
+}
+
+pub async fn write_reply_async<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    status: u8,
+    address: SocketAddr,
+) -> io::Result<()> {
+    let mut bytes = vec![5, status, 0];
+    encode_address(&mut bytes, address);
+    writer.write_all(&bytes).await
+}
+
 fn encode_address(bytes: &mut Vec<u8>, address: SocketAddr) {
     match address.ip() {
         IpAddr::V4(ip) => {

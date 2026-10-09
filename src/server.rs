@@ -1,22 +1,18 @@
 use crate::config::Config;
 use crate::dns::DnsResolver;
+use crate::happy_eyeballs::happy_eyeballs_connect;
 use crate::protocol::{self, Host, Target};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
-};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const UDP_BUFFER_SIZE: usize = 65_535;
-const UDP_POOL_CAPACITY: usize = 64;
 
 type Associations = Arc<Mutex<HashMap<u64, Arc<Association>>>>;
 
@@ -51,17 +47,9 @@ impl Association {
 }
 
 struct Flow {
-    socket: UdpSocket,
+    socket: Arc<tokio::net::UdpSocket>,
     last_activity: Mutex<Instant>,
 }
-
-struct UdpTask {
-    packet: Vec<u8>,
-    length: usize,
-    source: SocketAddr,
-}
-
-type PacketPool = Arc<Mutex<Vec<Vec<u8>>>>;
 
 fn normalize(ip: IpAddr) -> IpAddr {
     match ip {
@@ -73,11 +61,17 @@ fn normalize(ip: IpAddr) -> IpAddr {
     }
 }
 
+async fn check_shutdown(flag: &AtomicBool) {
+    while !flag.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 pub struct Server {
     config: Arc<Config>,
     dns: Arc<DnsResolver>,
-    tcp: TcpListener,
-    udp: Arc<UdpSocket>,
+    tcp: std::net::TcpListener,
+    udp: Arc<std::net::UdpSocket>,
     associations: Associations,
     next_id: AtomicU64,
     shutdown: Arc<AtomicBool>,
@@ -89,16 +83,17 @@ impl Server {
         let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), config.port);
         let tcp_socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
         tcp_socket.set_only_v6(false)?;
+        tcp_socket.set_nonblocking(true)?;
         tcp_socket.bind(&address.into())?;
         tcp_socket.listen(1024)?;
-        let tcp: TcpListener = tcp_socket.into();
+        let tcp: std::net::TcpListener = tcp_socket.into();
         let udp_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         udp_socket.set_only_v6(false)?;
+        udp_socket.set_nonblocking(true)?;
         let udp_address =
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), tcp.local_addr()?.port());
         udp_socket.bind(&udp_address.into())?;
-        let udp = Arc::new(UdpSocket::from(udp_socket));
-        udp.set_read_timeout(Some(POLL_INTERVAL))?;
+        let udp = Arc::new(std::net::UdpSocket::from(udp_socket));
         Ok(Self {
             config: Arc::new(config),
             dns,
@@ -115,121 +110,126 @@ impl Server {
     }
 
     pub fn run(self) -> io::Result<()> {
-        let relay = Arc::clone(&self.udp);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(self.run_async()))
+        } else {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(self.run_async())
+        }
+    }
+
+    pub async fn run_async(self) -> io::Result<()> {
+        let tcp = tokio::net::TcpListener::from_std(self.tcp)?;
+        let udp = Arc::new(tokio::net::UdpSocket::from_std((*self.udp).try_clone()?)?);
+
+        let relay = Arc::clone(&udp);
         let associations = Arc::clone(&self.associations);
         let shutdown = Arc::clone(&self.shutdown);
         let config = Arc::clone(&self.config);
         let dns = Arc::clone(&self.dns);
-        let udp_thread =
-            thread::spawn(move || udp_loop(relay, associations, config, dns, shutdown));
 
-        let wake_address = SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            self.tcp.local_addr()?.port(),
-        );
-        let wake_flag = Arc::clone(&self.shutdown);
-        let wake_thread = thread::spawn(move || {
-            while !wake_flag.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(20));
-            }
-            let _ = TcpStream::connect_timeout(&wake_address, Duration::from_secs(1));
+        let udp_task = tokio::spawn(async move {
+            udp_loop(relay, associations, config, dns, shutdown).await
         });
 
         let mut result = Ok(());
         while !self.shutdown.load(Ordering::Relaxed) {
-            match self.tcp.accept() {
-                Ok((stream, address)) => {
-                    if self.shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if !self.config.whitelist.allows(address.ip()) {
-                        continue;
-                    }
-                    if let Err(error) = stream.set_nonblocking(false) {
-                        eprintln!("连接 {address} 设置阻塞模式失败：{error}");
-                        continue;
-                    }
-                    let config = Arc::clone(&self.config);
-                    let dns = Arc::clone(&self.dns);
-                    let associations = Arc::clone(&self.associations);
-                    let udp = Arc::clone(&self.udp);
-                    let shutdown = Arc::clone(&self.shutdown);
-                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                    thread::spawn(move || {
-                        if let Err(error) =
-                            handle_client(stream, config, dns, udp, associations, id, shutdown)
-                            && !matches!(
-                                error.kind(),
-                                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-                            )
-                        {
-                            eprintln!("连接 {address} 处理失败：{error}");
+            tokio::select! {
+                _ = check_shutdown(&self.shutdown) => break,
+                accept_res = tcp.accept() => {
+                    match accept_res {
+                        Ok((stream, address)) => {
+                            if self.shutdown.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if !self.config.whitelist.allows(address.ip()) {
+                                continue;
+                            }
+                            let config = Arc::clone(&self.config);
+                            let dns = Arc::clone(&self.dns);
+                            let associations = Arc::clone(&self.associations);
+                            let udp = Arc::clone(&udp);
+                            let shutdown = Arc::clone(&self.shutdown);
+                            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                            tokio::spawn(async move {
+                                if let Err(error) =
+                                    handle_client(stream, config, dns, udp, associations, id, shutdown).await
+                                    && !matches!(
+                                        error.kind(),
+                                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                                    )
+                                {
+                                    eprintln!("连接 {address} 处理失败：{error}");
+                                }
+                            });
                         }
-                    });
-                }
-                Err(error) => {
-                    result = Err(error);
-                    break;
+                        Err(error) => {
+                            result = Err(error);
+                            break;
+                        }
+                    }
                 }
             }
         }
+
         self.shutdown.store(true, Ordering::Relaxed);
-        let _ = wake_thread.join();
         for association in self.associations.lock().unwrap().values() {
             association.alive.store(false, Ordering::Relaxed);
         }
-        let udp_result = udp_thread
-            .join()
-            .map_err(|_| io::Error::other("UDP 接收线程异常退出"))?;
+        let udp_result = udp_task
+            .await
+            .map_err(|_| io::Error::other("UDP 任务异常退出"))?;
         result.and(udp_result)
     }
 }
 
-fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<()> {
-    let mut header = [0; 2];
-    stream.read_exact(&mut header)?;
+async fn negotiate(stream: &mut tokio::net::TcpStream, config: &Config) -> io::Result<()> {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await?;
     if header[0] != 5 || header[1] == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "SOCKS5 协商请求无效",
         ));
     }
-    let mut methods = vec![0; usize::from(header[1])];
-    stream.read_exact(&mut methods)?;
+    let mut methods = vec![0u8; usize::from(header[1])];
+    stream.read_exact(&mut methods).await?;
     let selected = if config.username.is_empty() { 0 } else { 2 };
     if !methods.contains(&selected) {
-        stream.write_all(&[5, 255])?;
+        stream.write_all(&[5, 255]).await?;
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "客户端没有提供可用的认证方法",
         ));
     }
-    stream.write_all(&[5, selected])?;
+    stream.write_all(&[5, selected]).await?;
     if selected == 2 {
-        let mut auth_header = [0; 2];
-        stream.read_exact(&mut auth_header)?;
+        let mut auth_header = [0u8; 2];
+        stream.read_exact(&mut auth_header).await?;
         if auth_header[0] != 1 || auth_header[1] == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "用户名密码认证请求无效",
             ));
         }
-        let mut username = vec![0; usize::from(auth_header[1])];
-        stream.read_exact(&mut username)?;
-        let mut password_length = [0];
-        stream.read_exact(&mut password_length)?;
+        let mut username = vec![0u8; usize::from(auth_header[1])];
+        stream.read_exact(&mut username).await?;
+        let mut password_length = [0u8; 1];
+        stream.read_exact(&mut password_length).await?;
         if password_length[0] == 0 {
-            stream.write_all(&[1, 1])?;
+            stream.write_all(&[1, 1]).await?;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "密码不能为空",
             ));
         }
-        let mut password = vec![0; usize::from(password_length[0])];
-        stream.read_exact(&mut password)?;
+        let mut password = vec![0u8; usize::from(password_length[0])];
+        stream.read_exact(&mut password).await?;
         let allowed = constant_time_eq(&username, config.username.as_bytes())
             & constant_time_eq(&password, config.password.as_bytes());
-        stream.write_all(&[1, if allowed { 0 } else { 1 }])?;
+        stream.write_all(&[1, if allowed { 0 } else { 1 }]).await?;
         if !allowed {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -255,106 +255,141 @@ fn unspecified(ip: IpAddr) -> SocketAddr {
     }
 }
 
-fn handle_client(
-    mut stream: TcpStream,
+async fn handle_client(
+    mut stream: tokio::net::TcpStream,
     config: Arc<Config>,
     dns: Arc<DnsResolver>,
-    udp: Arc<UdpSocket>,
+    udp: Arc<tokio::net::UdpSocket>,
     associations: Associations,
     id: u64,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    negotiate(&mut stream, &config)?;
-    let (command, target) = match protocol::read_request(&mut stream) {
-        Ok(request) => request,
-        Err(error) => {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiate(&mut stream, &config))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 协商超时"))??;
+
+    let (command, target) = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        protocol::read_request_async(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => {
             if error.kind() == io::ErrorKind::InvalidData {
                 let address = unspecified(stream.local_addr()?.ip());
-                let _ = protocol::write_reply(&mut stream, protocol::ADDRESS_UNSUPPORTED, address);
+                let _ = protocol::write_reply_async(
+                    &mut stream,
+                    protocol::ADDRESS_UNSUPPORTED,
+                    address,
+                )
+                .await;
             }
             return Err(error);
         }
+        Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "读取请求超时")),
     };
+
     match command {
-        protocol::CONNECT => connect(stream, target, config.tcp_timeout, &dns),
-        protocol::UDP_ASSOCIATE => associate(&mut stream, target, udp, associations, id, shutdown),
+        protocol::CONNECT => connect(stream, target, config.tcp_timeout, &dns).await,
+        protocol::UDP_ASSOCIATE => {
+            associate(stream, target, udp, associations, id, shutdown).await
+        }
         _ => {
             let address = unspecified(stream.local_addr()?.ip());
-            protocol::write_reply(&mut stream, protocol::COMMAND_UNSUPPORTED, address)
+            protocol::write_reply_async(&mut stream, protocol::COMMAND_UNSUPPORTED, address)
+                .await
         }
     }
 }
 
-fn connect(
-    mut client: TcpStream,
+async fn connect(
+    mut client: tokio::net::TcpStream,
     target: Target,
     timeout: Option<Duration>,
     dns: &DnsResolver,
 ) -> io::Result<()> {
     let address = unspecified(client.local_addr()?.ip());
-    let addresses = match dns.lookup(&target) {
+    let addresses = match dns.lookup(&target).await {
         Ok(addresses) => addresses,
         Err(error) => {
-            protocol::write_reply(&mut client, protocol::HOST_UNREACHABLE, address)?;
+            protocol::write_reply_async(&mut client, protocol::HOST_UNREACHABLE, address).await?;
             return Err(error);
         }
     };
-    let mut last_error = None;
-    let mut remote = None;
-    for destination in addresses {
-        match TcpStream::connect_timeout(&destination, HANDSHAKE_TIMEOUT) {
-            Ok(stream) => {
-                remote = Some(stream);
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    let mut remote = match remote {
-        Some(stream) => stream,
-        None => {
-            let error = last_error.unwrap_or_else(|| io::Error::other("目标连接失败"));
+
+    // 使用 Happy Eyeballs 双栈并发竞速建立连接
+    let mut remote = match happy_eyeballs_connect(&addresses, HANDSHAKE_TIMEOUT).await {
+        Ok(stream) => stream,
+        Err(error) => {
             let status = if error.kind() == io::ErrorKind::ConnectionRefused {
                 protocol::CONNECTION_REFUSED
             } else {
                 protocol::HOST_UNREACHABLE
             };
-            protocol::write_reply(&mut client, status, address)?;
+            protocol::write_reply_async(&mut client, status, address).await?;
             return Err(error);
         }
     };
-    protocol::write_reply(&mut client, protocol::SUCCESS, remote.local_addr()?)?;
-    client.set_read_timeout(timeout)?;
-    remote.set_read_timeout(timeout)?;
-    client.set_write_timeout(timeout)?;
-    remote.set_write_timeout(timeout)?;
 
-    let mut client_read = client.try_clone()?;
-    let mut remote_write = remote.try_clone()?;
-    let forward = thread::spawn(move || {
-        let result = io::copy(&mut client_read, &mut remote_write);
-        let _ = remote_write.shutdown(Shutdown::Write);
-        if result.is_err() {
-            let _ = client_read.shutdown(Shutdown::Both);
-            let _ = remote_write.shutdown(Shutdown::Both);
-        }
-    });
-    let result = io::copy(&mut remote, &mut client);
-    let _ = client.shutdown(Shutdown::Write);
-    if result.is_err() {
-        let _ = client.shutdown(Shutdown::Both);
-        let _ = remote.shutdown(Shutdown::Both);
-    }
-    let _ = forward.join();
-    result.map(|_| ())
+    protocol::write_reply_async(&mut client, protocol::SUCCESS, remote.local_addr()?).await?;
+    forward_bidirectional(&mut client, &mut remote, timeout).await
 }
 
-fn associate(
-    stream: &mut TcpStream,
+async fn forward_bidirectional(
+    client: &mut tokio::net::TcpStream,
+    remote: &mut tokio::net::TcpStream,
+    timeout: Option<Duration>,
+) -> io::Result<()> {
+    match timeout {
+        None => {
+            tokio::io::copy_bidirectional_with_sizes(client, remote, 65536, 65536)
+                .await
+                .map(|_| ())
+        }
+        Some(idle_timeout) => {
+            let (mut client_r, mut client_w) = client.split();
+            let (mut remote_r, mut remote_w) = remote.split();
+
+            let c2r = copy_direction_idle(&mut client_r, &mut remote_w, idle_timeout);
+            let r2c = copy_direction_idle(&mut remote_r, &mut client_w, idle_timeout);
+
+            tokio::try_join!(c2r, r2c).map(|_| ())
+        }
+    }
+}
+
+async fn copy_direction_idle<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    timeout: Duration,
+) -> io::Result<u64>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut buffer = vec![0u8; 65536];
+    let mut total = 0u64;
+    loop {
+        let n = match tokio::time::timeout(timeout, reader.read(&mut buffer)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP 连接空闲超时")),
+        };
+        if n == 0 {
+            writer.shutdown().await?;
+            break;
+        }
+        writer.write_all(&buffer[..n]).await?;
+        total += n as u64;
+    }
+    Ok(total)
+}
+
+async fn associate(
+    mut stream: tokio::net::TcpStream,
     target: Target,
-    udp: Arc<UdpSocket>,
+    udp: Arc<tokio::net::UdpSocket>,
     associations: Associations,
     id: u64,
     shutdown: Arc<AtomicBool>,
@@ -363,7 +398,7 @@ fn associate(
     match target.host {
         Host::Ip(ip) if !ip.is_unspecified() && normalize(ip) != normalize(peer.ip()) => {
             let address = unspecified(stream.local_addr()?.ip());
-            protocol::write_reply(stream, protocol::SERVER_FAILURE, address)?;
+            protocol::write_reply_async(&mut stream, protocol::SERVER_FAILURE, address).await?;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "UDP 客户端地址与控制连接不符",
@@ -371,7 +406,7 @@ fn associate(
         }
         Host::Domain(_) => {
             let address = unspecified(stream.local_addr()?.ip());
-            protocol::write_reply(stream, protocol::ADDRESS_UNSUPPORTED, address)?;
+            protocol::write_reply_async(&mut stream, protocol::ADDRESS_UNSUPPORTED, address).await?;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "UDP 客户端地址必须是 IP",
@@ -394,23 +429,21 @@ fn associate(
         .lock()
         .unwrap()
         .insert(id, Arc::clone(&association));
-    if let Err(error) = protocol::write_reply(stream, protocol::SUCCESS, relay) {
+    if let Err(error) = protocol::write_reply_async(&mut stream, protocol::SUCCESS, relay).await {
         association.alive.store(false, Ordering::Relaxed);
         associations.lock().unwrap().remove(&id);
         return Err(error);
     }
-    stream.set_read_timeout(Some(POLL_INTERVAL))?;
-    let mut buffer = [0; 1024];
+    let mut buffer = [0u8; 1024];
     while !shutdown.load(Ordering::Relaxed) {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(_) => break,
+        tokio::select! {
+            _ = check_shutdown(&shutdown) => break,
+            res = stream.read(&mut buffer) => {
+                match res {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
         }
     }
     association.alive.store(false, Ordering::Relaxed);
@@ -418,193 +451,170 @@ fn associate(
     Ok(())
 }
 
-fn udp_loop(
-    udp: Arc<UdpSocket>,
+async fn udp_loop(
+    udp: Arc<tokio::net::UdpSocket>,
     associations: Associations,
     config: Arc<Config>,
     dns: Arc<DnsResolver>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let (sender, receiver): (SyncSender<UdpTask>, Receiver<UdpTask>) = mpsc::sync_channel(1024);
-    let receiver = Arc::new(Mutex::new(receiver));
-    let pool: PacketPool = Arc::new(Mutex::new(Vec::new()));
-    let worker_count = thread::available_parallelism().map_or(4, |count| count.get().clamp(4, 16));
-    let workers: Vec<_> = (0..worker_count)
-        .map(|_| {
-            let receiver = Arc::clone(&receiver);
-            let udp = Arc::clone(&udp);
-            let associations = Arc::clone(&associations);
-            let config = Arc::clone(&config);
-            let dns = Arc::clone(&dns);
-            let pool = Arc::clone(&pool);
-            thread::spawn(move || {
-                loop {
-                    let task = receiver.lock().unwrap().recv();
-                    let Ok(task) = task else { break };
-                    handle_udp_packet(&udp, &associations, &config, &dns, &task);
-                    return_packet(&pool, task.packet);
-                }
-            })
-        })
-        .collect();
-    let mut result = Ok(());
+    let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
     while !shutdown.load(Ordering::Relaxed) {
-        let mut packet = pool
-            .lock()
-            .unwrap()
-            .pop()
-            .unwrap_or_else(|| vec![0; UDP_BUFFER_SIZE]);
-        let (length, source) = match udp.recv_from(&mut packet) {
-            Ok(packet) => packet,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return_packet(&pool, packet);
-                continue;
-            }
-            Err(error) => {
-                return_packet(&pool, packet);
-                shutdown.store(true, Ordering::Relaxed);
-                result = Err(error);
-                break;
+        let (length, source) = tokio::select! {
+            _ = check_shutdown(&shutdown) => break,
+            res = udp.recv_from(&mut buffer) => {
+                match res {
+                    Ok(val) => val,
+                    Err(error) => {
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+                        ) {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
             }
         };
-        if let Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) =
-            sender.try_send(UdpTask {
-                packet,
-                length,
-                source,
-            })
-        {
-            return_packet(&pool, task.packet);
+
+        if !config.whitelist.allows(source.ip()) {
+            continue;
         }
+
+        let Ok((target, payload)) = protocol::parse_datagram(&buffer[..length]) else {
+            continue;
+        };
+
+        let association = {
+            let map = associations.lock().unwrap();
+            map.values()
+                .find(|association| {
+                    association.alive.load(Ordering::Relaxed)
+                        && association.is_bound_to(source)
+                })
+                .or_else(|| {
+                    map.values().find(|association| {
+                        association.alive.load(Ordering::Relaxed)
+                            && association.accepts(source)
+                    })
+                })
+                .cloned()
+        };
+
+        let Some(association) = association else {
+            continue;
+        };
+
+        let relay = Arc::clone(&udp);
+        let config = Arc::clone(&config);
+        let dns = Arc::clone(&dns);
+        let payload = payload.to_vec();
+        tokio::spawn(async move {
+            handle_udp_packet(&relay, &association, &config, &dns, target, payload).await;
+        });
     }
-    drop(sender);
-    for worker in workers {
-        let _ = worker.join();
-    }
-    result
+    Ok(())
 }
 
-fn return_packet(pool: &PacketPool, packet: Vec<u8>) {
-    let mut buffers = pool.lock().unwrap();
-    if buffers.len() < UDP_POOL_CAPACITY {
-        buffers.push(packet);
-    }
-}
-
-fn handle_udp_packet(
-    udp: &Arc<UdpSocket>,
-    associations: &Associations,
+async fn handle_udp_packet(
+    udp: &Arc<tokio::net::UdpSocket>,
+    association: &Arc<Association>,
     config: &Config,
     dns: &DnsResolver,
-    task: &UdpTask,
+    target: Target,
+    payload: Vec<u8>,
 ) {
-    if !config.whitelist.allows(task.source.ip()) {
+    if !association.alive.load(Ordering::Relaxed) {
         return;
     }
-    let Ok((target, payload)) = protocol::parse_datagram(&task.packet[..task.length]) else {
-        return;
+
+    let existing = {
+        let flows = association.flows.lock().unwrap();
+        flows.get(&target).cloned()
     };
-    let association = {
-        let map = associations.lock().unwrap();
-        map.values()
-            .find(|association| {
-                association.alive.load(Ordering::Relaxed) && association.is_bound_to(task.source)
-            })
-            .or_else(|| {
-                map.values().find(|association| {
-                    association.alive.load(Ordering::Relaxed) && association.accepts(task.source)
-                })
-            })
-            .cloned()
-    };
-    let Some(association) = association else {
-        return;
-    };
-    let existing = association.flows.lock().unwrap().get(&target).cloned();
+
     let flow = if let Some(flow) = existing {
         flow
     } else {
-        let Ok(addresses) = dns.lookup(&target) else {
+        let Ok(addresses) = dns.lookup(&target).await else {
             return;
         };
         let destination = addresses[0];
-        let Ok(socket) = UdpSocket::bind(unspecified(destination.ip())) else {
+        let Ok(std_socket) = std::net::UdpSocket::bind(unspecified(destination.ip())) else {
             return;
         };
-        if socket.connect(destination).is_err()
-            || socket
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .is_err()
-        {
+        if std_socket.connect(destination).is_err() {
             return;
         }
+        std_socket.set_nonblocking(true).ok();
+        let Ok(socket) = tokio::net::UdpSocket::from_std(std_socket) else {
+            return;
+        };
+        let socket = Arc::new(socket);
         let candidate = Arc::new(Flow {
             socket,
             last_activity: Mutex::new(Instant::now()),
         });
+
         let mut flows = association.flows.lock().unwrap();
         if let Some(flow) = flows.get(&target) {
             Arc::clone(flow)
         } else {
             flows.insert(target.clone(), Arc::clone(&candidate));
-            let association = Arc::clone(&association);
+            let association = Arc::clone(association);
             let relay = Arc::clone(udp);
             let worker = Arc::clone(&candidate);
             let timeout = config.udp_timeout;
-            thread::spawn(move || {
-                receive_remote(worker, relay, association, target, destination, timeout)
+            tokio::spawn(async move {
+                receive_remote(worker, relay, association, target, destination, timeout).await;
             });
             candidate
         }
     };
+
     *flow.last_activity.lock().unwrap() = Instant::now();
-    let _ = flow.socket.send(payload);
+    let _ = flow.socket.send(&payload).await;
 }
 
-fn receive_remote(
+async fn receive_remote(
     flow: Arc<Flow>,
-    relay: Arc<UdpSocket>,
+    relay: Arc<tokio::net::UdpSocket>,
     association: Arc<Association>,
     target: Target,
     destination: SocketAddr,
     timeout: Duration,
 ) {
-    let mut buffer = vec![0; UDP_BUFFER_SIZE];
+    let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
     while association.alive.load(Ordering::Relaxed) {
-        match flow.socket.recv(&mut buffer[22..]) {
-            Ok(length) => {
+        let recv_future = flow.socket.recv(&mut buffer[22..]);
+        let res = if !timeout.is_zero() {
+            tokio::time::timeout(timeout, recv_future).await
+        } else {
+            Ok(recv_future.await)
+        };
+
+        match res {
+            Ok(Ok(length)) => {
                 if !association.alive.load(Ordering::Relaxed) {
                     break;
                 }
                 *flow.last_activity.lock().unwrap() = Instant::now();
-                if let Some(source) = *association.endpoint.lock().unwrap() {
+                let source = { *association.endpoint.lock().unwrap() };
+                if let Some(source) = source {
                     let header_length = protocol::datagram_header_len(destination);
                     let start = 22 - header_length;
                     protocol::write_datagram_header(&mut buffer[start..22], destination);
-                    let _ = relay.send_to(&buffer[start..22 + length], source);
+                    let _ = relay.send_to(&buffer[start..22 + length], source).await;
                 }
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
+            Ok(Err(_)) => break,
             Err(_) => break,
         }
-        if !timeout.is_zero() && flow.last_activity.lock().unwrap().elapsed() >= timeout {
-            break;
-        }
     }
+
     let mut flows = association.flows.lock().unwrap();
-    if flows
-        .get(&target)
-        .is_some_and(|current| Arc::ptr_eq(current, &flow))
-    {
+    if flows.get(&target).is_some_and(|current| Arc::ptr_eq(current, &flow)) {
         flows.remove(&target);
     }
 }
@@ -613,6 +623,10 @@ fn receive_remote(
 mod tests {
     use super::*;
     use crate::config::Whitelist;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+    use std::sync::mpsc;
+    use std::thread;
 
     fn start_server(
         username: &str,
