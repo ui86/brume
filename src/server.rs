@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::dns::DnsResolver;
 use crate::happy_eyeballs::happy_eyeballs_connect;
 use crate::protocol::{self, Host, Target};
+use hickory_resolver::net::NetError;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -276,10 +277,7 @@ impl Server {
                                 let _permit = permit;
                                 if let Err(error) =
                                     handle_client(stream, config, dns, udp, associations, id, shutdown).await
-                                    && !matches!(
-                                        error.kind(),
-                                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-                                    )
+                                    && should_log_client_error(&error)
                                 {
                                     eprintln!("连接 {address} 处理失败：{error}");
                                 }
@@ -378,6 +376,27 @@ fn unspecified(ip: IpAddr) -> SocketAddr {
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     }
+}
+
+fn should_log_client_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    ) {
+        return false;
+    }
+    if error.kind() == io::ErrorKind::PermissionDenied
+        && error.to_string() == "UDP 客户端地址与控制连接不符"
+    {
+        return false;
+    }
+    if error.kind() == io::ErrorKind::TimedOut && error.to_string() == "连接目标超时" {
+        return false;
+    }
+    !error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<NetError>())
+        .is_some_and(NetError::is_no_records_found)
 }
 
 async fn handle_client(
