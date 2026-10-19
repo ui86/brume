@@ -70,7 +70,13 @@ write_config_file() {
 
 # 按字面值读取配置，避免将密码作为 Shell 代码执行
 load_config_file() {
-    local line key value content
+    local line key value content file_content
+    local config_file=${1:-${CONFIG_FILE}}
+    # 先确认整份文件读取成功，避免读取错误被当成空配置
+    if [ ! -f "${config_file}" ] || ! file_content=$(cat -- "${config_file}"); then
+        echo "读取服务配置文件失败" >&2
+        return 1
+    fi
     while IFS= read -r line || [ -n "${line}" ]; do
         line=${line%$'\r'}
         content=${line#"${line%%[![:space:]]*}"}
@@ -93,7 +99,7 @@ load_config_file() {
             dns_servers) dns_servers=${value} ;;
             *) echo "配置文件包含未知配置项" >&2; return 1 ;;
         esac
-    done < "${CONFIG_FILE}"
+    done <<< "${file_content}"
 }
 
 # 颜色定义
@@ -656,12 +662,8 @@ setup_firewall_nftables() {
     execute_privileged nft add rule inet brume input tcp dport "${port}" drop
     execute_privileged nft add rule inet brume input udp dport "${port}" drop
 
-    # 持久化 nftables 规则
-    if [ -f /etc/nftables.conf ]; then
-        execute_privileged nft list ruleset > /tmp/brume_nft_backup.conf
-        execute_privileged cp /tmp/brume_nft_backup.conf /etc/nftables.conf
-        rm -f /tmp/brume_nft_backup.conf
-    fi
+    # 导出失败时保留原配置，临时文件只允许当前用户访问
+    persist_nftables_rules /etc/nftables.conf || return 1
 
     echo -e "${GREEN}nftables 防火墙规则配置完成${RESET}"
 }
@@ -728,6 +730,23 @@ setup_firewall_iptables() {
 
     echo -e "${GREEN}iptables 防火墙规则配置完成${RESET}"
 }
+
+# 使用私有临时文件保存规则，退出或中断时均清理文件
+persist_nftables_rules() (
+    local config_file=$1
+    local temp_file
+
+    [ -f "${config_file}" ] || return 0
+    temp_file=$(mktemp) || return 1
+    trap 'rm -f -- "${temp_file}"' EXIT
+    trap 'exit 1' HUP INT TERM
+
+    if ! execute_privileged nft list ruleset > "${temp_file}"; then
+        echo "导出 nftables 规则失败，已保留原持久化配置" >&2
+        return 1
+    fi
+    execute_privileged cp -- "${temp_file}" "${config_file}"
+)
 
 # 持久化 iptables 规则
 persist_iptables_rules() {
@@ -815,12 +834,8 @@ remove_firewall_nftables() {
     # 删除 brume 表
     execute_privileged nft delete table inet brume 2>/dev/null
 
-    # 更新持久化配置
-    if [ -f /etc/nftables.conf ]; then
-        execute_privileged nft list ruleset > /tmp/brume_nft_cleanup.conf 2>/dev/null
-        execute_privileged cp /tmp/brume_nft_cleanup.conf /etc/nftables.conf 2>/dev/null
-        rm -f /tmp/brume_nft_cleanup.conf
-    fi
+    # 更新持久化配置，导出失败时不覆盖原文件
+    persist_nftables_rules /etc/nftables.conf || return 1
 
     echo -e "${GREEN}nftables 规则已清除${RESET}"
 }
@@ -1001,8 +1016,7 @@ prepare_binary() {
     fi
 
     # 当前配置显式使用自定义 DNS 时，拒绝安装不兼容的旧版本
-    if [ -f "${CONFIG_FILE}" ] \
-        && grep -Eq '^[[:space:]]*dns_servers[[:space:]]*=' "${CONFIG_FILE}" \
+    if [ "${dns_servers:-${DEFAULT_DNS_SERVERS}}" != "${DEFAULT_DNS_SERVERS}" ] \
         && ! binary_supports_dns "${prepared_dir}/brume"; then
         echo -e "${RED}该版本不支持 dns_servers，请选择包含 --dns-servers 功能的新版本${RESET}"
         rm -rf "${prepared_dir}"
@@ -1469,71 +1483,223 @@ get_modify_config() {
 # 更新函数
 # ============================================================
 
-# 自动获取当前所有参数（非交互式）
-get_current_config_auto() {
-    local init_system=$1
-    local service_file
-
-    case "${init_system}" in
-        systemd) service_file="/etc/systemd/system/${SERVICE_NAME}.service" ;;
-        openrc|sysvinit) service_file="/etc/init.d/${SERVICE_NAME}" ;;
+# 获取服务定义路径，读取参数时始终检查实际执行文件
+get_service_file() {
+    case "$1" in
+        systemd) printf '%s\n' "/etc/systemd/system/${SERVICE_NAME}.service" ;;
+        openrc|sysvinit) printf '%s\n' "/etc/init.d/${SERVICE_NAME}" ;;
+        *) echo "不支持的服务管理器" >&2; return 1 ;;
     esac
+}
 
-    if [ ! -f "${service_file}" ]; then
-        echo -e "${RED}Brume 服务未安装，无法更新${RESET}"
-        exit 1
-    fi
+# 检查服务专用、名称前缀及所有服务共用的扩展目录
+get_systemd_dropin_directories() {
+    local directory prefix
+    for directory in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+        printf '%s\n' "${directory}/${SERVICE_NAME}.service.d" "${directory}/service.d"
+        prefix=${SERVICE_NAME}
+        while [[ "${prefix}" == *-* ]]; do
+            prefix=${prefix%-*}
+            printf '%s\n' "${directory}/${prefix}-.service.d"
+        done
+    done
+}
 
-    local cmd_args=""
-    case "${init_system}" in
-        systemd)
-            local exec_start
-            exec_start=$(execute_privileged grep '^ExecStart=' "${service_file}" 2>/dev/null | head -n1)
-            cmd_args=$(echo "$exec_start" | sed "s|^ExecStart=${INSTALL_DIR}/brume ||")
-            ;;
-        openrc)
-            cmd_args=$(execute_privileged grep '^command_args=' "${service_file}" 2>/dev/null | head -n1 | sed 's/^command_args="//' | sed 's/"$//')
-            ;;
-        sysvinit)
-            cmd_args=$(execute_privileged grep '^DAEMON_ARGS=' "${service_file}" 2>/dev/null | head -n1 | sed 's/^DAEMON_ARGS="//' | sed 's/"$//')
-            ;;
-    esac
-
-    # 初始化配置
-    port="${DEFAULT_PORT}"
-    user=""
-    password=""
-    whitelist=""
-    tcp_timeout="${DEFAULT_TCP_TIMEOUT}"
-    udp_timeout="${DEFAULT_UDP_TIMEOUT}"
-    dns_servers="${DEFAULT_DNS_SERVERS}"
-    uses_config_file=false
-
-    if [[ " ${cmd_args} " == *" --config "* ]]; then
-        if [[ "${cmd_args}" != *"--config ${CONFIG_FILE}"* ]] || [ ! -f "${CONFIG_FILE}" ]; then
-            echo "服务配置文件路径无效，请检查 ${CONFIG_FILE}" >&2
+# 扩展定义可能覆盖实际启动命令，不能只根据主文件推断有效配置
+validate_systemd_service_definition() {
+    local directory directories
+    directories=$(get_systemd_dropin_directories) || return 1
+    while IFS= read -r directory; do
+        if [ -e "${directory}" ] || [ -L "${directory}" ]; then
+            echo "systemd 服务存在扩展定义，请先手动确认有效配置后再迁移" >&2
             return 1
         fi
-        uses_config_file=true
-        load_config_file
-        return
+    done <<< "${directories}"
+}
+
+# 只接受唯一的直接赋值，拒绝重置、多行命令及其他模糊定义
+read_service_assignment() {
+    local service_file=$1 key=$2 line value="" found=false
+    while IFS= read -r line || [ -n "${line}" ]; do
+        line=${line%$'\r'}
+        if [[ "${line}" == "${key}="* ]]; then
+            if [ "${found}" = true ]; then
+                echo "服务定义包含重复的 ${key}，无法安全迁移" >&2
+                return 1
+            fi
+            value=${line#*=}
+            found=true
+        fi
+    done < "${service_file}"
+    if [ "${found}" != true ] || [ -z "${value}" ]; then
+        echo "服务定义缺少有效的 ${key}，无法安全迁移" >&2
+        return 1
+    fi
+    printf '%s\n' "${value}"
+}
+
+# 按字面值安全分词，无法还原的转义、变量和命令展开直接拒绝
+split_service_arguments() {
+    local text=$1 char quote="" token="" started=false index
+    service_args=()
+    for ((index=0; index<${#text}; index++)); do
+        char=${text:index:1}
+        case "${char}" in
+            '$'|'`'|'\'|'%'|$'\n'|$'\r')
+                echo "服务参数包含无法安全迁移的转义或展开" >&2
+                return 1
+                ;;
+        esac
+        if [ -n "${quote}" ]; then
+            if [ "${char}" = "${quote}" ]; then
+                quote=""
+            else
+                token+=${char}
+            fi
+        else
+            case "${char}" in
+                "'"|'"') quote=${char}; started=true ;;
+                ' '|$'\t')
+                    if [ "${started}" = true ]; then
+                        service_args+=("${token}")
+                        token=""
+                        started=false
+                    fi
+                    ;;
+                ';'|'&'|'|'|'<'|'>'|'('|')')
+                    echo "服务参数包含不支持的命令语法" >&2
+                    return 1
+                    ;;
+                *) token+=${char}; started=true ;;
+            esac
+        fi
+    done
+    if [ -n "${quote}" ]; then
+        echo "服务参数包含未闭合的引号" >&2
+        return 1
+    fi
+    if [ "${started}" = true ]; then
+        service_args+=("${token}")
+    fi
+}
+
+# 自动读取真实配置文件，再按程序规则应用全部命令行覆盖项
+get_current_config_auto() {
+    local init_system=$1
+    local service_file command_args executable assignment key value config_path=""
+    local -a service_args override_keys=() override_values=()
+    local LC_ALL=C
+
+    service_file=$(get_service_file "${init_system}") || return 1
+    if [ ! -f "${service_file}" ]; then
+        echo -e "${RED}Brume 服务未安装，无法更新${RESET}" >&2
+        return 1
     fi
 
-    # 将旧服务参数拆分为数组，避免通配符展开
-    local -a legacy_args
-    read -r -a legacy_args <<< "${cmd_args}"
-    set -- "${legacy_args[@]}"
+    case "${init_system}" in
+        systemd)
+            validate_systemd_service_definition || return 1
+            if [ -L "${service_file}" ]; then
+                echo "systemd 服务文件是符号链接，无法安全确认有效配置" >&2
+                return 1
+            fi
+            command_args=$(read_service_assignment "${service_file}" ExecStart) || return 1
+            split_service_arguments "${command_args}" || return 1
+            if [ "${#service_args[@]}" -eq 0 ] || [ "${service_args[0]}" != "${INSTALL_DIR}/brume" ]; then
+                echo "服务执行文件不是 ${INSTALL_DIR}/brume，无法安全迁移" >&2
+                return 1
+            fi
+            service_args=("${service_args[@]:1}")
+            ;;
+        openrc|sysvinit)
+            if [ "${init_system}" = openrc ]; then
+                executable=command
+                assignment=command_args
+            else
+                executable=DAEMON
+                assignment=DAEMON_ARGS
+            fi
+            command_args=$(read_service_assignment "${service_file}" "${executable}") || return 1
+            split_service_arguments "${command_args}" || return 1
+            if [ "${#service_args[@]}" -ne 1 ] || [ "${service_args[0]}" != "${INSTALL_DIR}/brume" ]; then
+                echo "服务执行文件不是 ${INSTALL_DIR}/brume，无法安全迁移" >&2
+                return 1
+            fi
+            command_args=$(read_service_assignment "${service_file}" "${assignment}") || return 1
+            split_service_arguments "${command_args}" || return 1
+            if [ "${#service_args[@]}" -ne 1 ]; then
+                echo "服务参数赋值无法安全迁移" >&2
+                return 1
+            fi
+            command_args=${service_args[0]}
+            split_service_arguments "${command_args}" || return 1
+            ;;
+    esac
+
+    set -- "${service_args[@]}"
     while [ $# -gt 0 ]; do
-        case "$1" in
-            -p) port="$2"; shift 2 ;;
-            -user) user="$2"; shift 2 ;;
-            -pwd) password="$2"; shift 2 ;;
-            --whitelist) whitelist="$2"; shift 2 ;;
-            --tcp-timeout) tcp_timeout="$2"; shift 2 ;;
-            --udp-timeout) udp_timeout="$2"; shift 2 ;;
-            *) shift ;;
+        key=${1%%=*}
+        case "${key}" in
+            --config|-p|--port|-user|--user|-pwd|--pwd|--whitelist|--tcp-timeout|--udp-timeout|--dns-servers) ;;
+            *) echo "服务包含不支持的参数，无法安全迁移" >&2; return 1 ;;
+        esac
+        if [[ "$1" == *=* ]]; then
+            value=${1#*=}
+            shift
+        else
+            if [ $# -lt 2 ]; then
+                echo "服务参数 ${key} 缺少值" >&2
+                return 1
+            fi
+            value=$2
+            shift 2
+        fi
+        if [ "${key}" = --config ]; then
+            if [ -n "${config_path}" ] || [[ "${value}" != /* ]]; then
+                echo "服务必须使用唯一的绝对配置文件路径" >&2
+                return 1
+            fi
+            config_path=${value}
+        else
+            override_keys+=("${key}")
+            override_values+=("${value}")
+        fi
+    done
+
+    port="${DEFAULT_PORT}" user="" password="" whitelist=""
+    tcp_timeout="${DEFAULT_TCP_TIMEOUT}" udp_timeout="${DEFAULT_UDP_TIMEOUT}"
+    dns_servers="${DEFAULT_DNS_SERVERS}" uses_config_file=false
+    if [ -n "${config_path}" ]; then
+        if [ ! -f "${config_path}" ]; then
+            echo "服务配置文件不存在，无法安全迁移" >&2
+            return 1
+        fi
+        load_config_file "${config_path}" || return 1
+        uses_config_file=true
+    fi
+
+    local index
+    for ((index=0; index<${#override_keys[@]}; index++)); do
+        value=${override_values[index]}
+        case "${override_keys[index]}" in
+            -p|--port) port=${value} ;;
+            -user|--user) user=${value} ;;
+            -pwd|--pwd) password=${value} ;;
+            --whitelist) whitelist=${value} ;;
+            --tcp-timeout) tcp_timeout=${value} ;;
+            --udp-timeout) udp_timeout=${value} ;;
+            --dns-servers) dns_servers=${value} ;;
         esac
     done
+    if [[ ! "${port}" =~ ^[0-9]+$ ]] || [ "${#port}" -gt 5 ] \
+        || [ "${port}" -lt 1 ] || [ "${port}" -gt 65535 ] \
+        || [[ ! "${tcp_timeout}" =~ ^[0-9]+$ || ! "${udp_timeout}" =~ ^[0-9]+$ ]] \
+        || { [ -z "${user}" ] && [ -n "${password}" ]; } \
+        || { [ -n "${user}" ] && [ -z "${password}" ]; } \
+        || [ "${#user}" -gt 255 ] || [ "${#password}" -gt 255 ]; then
+        echo "服务配置无效，无法安全迁移" >&2
+        return 1
+    fi
 }
 
 upgrade() {
@@ -1554,17 +1720,10 @@ upgrade() {
     # 4. 下载并检查新程序
     prepare_binary "${version}" "${arch}"
 
-    # 5. 迁移旧配置或收紧已有文件权限
-    if [ "${uses_config_file}" != true ]; then
-        if ! write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}"; then
-            rm -rf "${prepared_dir}"
-            return 1
-        fi
-    else
-        if ! chmod 700 "${CONFIG_DIR}" || ! chmod 600 "${CONFIG_FILE}"; then
-            rm -rf "${prepared_dir}"
-            return 1
-        fi
+    # 5. 保存完整有效配置，保留自定义文件和命令行覆盖后的实际行为
+    if ! write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}"; then
+        rm -rf "${prepared_dir}"
+        return 1
     fi
 
     # 6. 保持旧进程运行，原子替换程序并更新服务定义
