@@ -233,9 +233,6 @@ pub fn parse_datagram(bytes: &[u8]) -> io::Result<(Target, &[u8])> {
     }
     let mut reader = &bytes[4..];
     let target = read_target(&mut reader, bytes[3])?;
-    if reader.is_empty() {
-        return Err(invalid_data("UDP 数据报没有负载"));
-    }
     Ok((target, reader))
 }
 
@@ -345,6 +342,26 @@ mod tests {
         ] {
             assert!(parse_datagram(packet).is_err());
         }
+    }
+
+    #[test]
+    fn datagrams_accept_empty_payloads_for_all_address_types() {
+        for address in ["127.0.0.1:443", "[2001:db8::1]:443"] {
+            let address: SocketAddr = address.parse().unwrap();
+            let packet = encode_datagram(address, &[]);
+            assert_eq!(
+                parse_datagram(&packet).unwrap(),
+                (Target::from(address), [].as_slice())
+            );
+            assert!(parse_datagram(&packet[..packet.len() - 1]).is_err());
+        }
+        let target = Target {
+            host: Host::Domain("example.com".into()),
+            port: 443,
+        };
+        let packet = encode_datagram_to(&target, &[]).unwrap();
+        assert_eq!(parse_datagram(&packet).unwrap(), (target, [].as_slice()));
+        assert!(parse_datagram(&packet[..packet.len() - 1]).is_err());
     }
 
     #[test]

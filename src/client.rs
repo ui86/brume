@@ -313,19 +313,20 @@ mod tests {
         };
         let echo_thread = thread::spawn(move || {
             let mut payload = [0; 100];
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (length, source) = echo.recv_from(&mut payload).unwrap();
                 echo.send_to(&payload[..length], source).unwrap();
             }
         });
         let (address, shutdown, server_thread) = start_server();
-        let client = Client::new(&address, "admin", "secret").unwrap();
+        let mut client = Client::new(&address, "admin", "secret").unwrap();
+        client.set_udp_timeout(Some(Duration::from_secs(3)));
         let association = client.associate(target.clone()).unwrap();
-        for _ in 0..2 {
-            assert_eq!(association.send(b"hello").unwrap(), 5);
+        for message in [b"hello".as_slice(), [].as_slice(), b"again".as_slice()] {
+            assert_eq!(association.send(message).unwrap(), message.len());
             let mut payload = [0; 100];
             let (length, source) = association.recv(&mut payload).unwrap();
-            assert_eq!(&payload[..length], b"hello");
+            assert_eq!(&payload[..length], message);
             assert_eq!(source, Target::from(destination));
         }
         echo_thread.join().unwrap();
