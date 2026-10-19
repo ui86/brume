@@ -1,10 +1,10 @@
-use crate::happy_eyeballs::happy_eyeballs_connect;
+use crate::client_dns::ClientDns;
 use crate::protocol::{self, Host, Target};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 
@@ -25,15 +25,14 @@ fn connector_runtime() -> io::Result<&'static Runtime> {
         .map_err(|error| io::Error::other(error.clone()))
 }
 
-fn connect_proxy(server: String) -> io::Result<TcpStream> {
+fn connect_proxy(server: String, dns: Arc<ClientDns>, timeout: Duration) -> io::Result<TcpStream> {
     if let Ok(address) = server.parse::<SocketAddr>() {
-        return TcpStream::connect_timeout(&address, CONNECT_TIMEOUT);
+        return TcpStream::connect_timeout(&address, timeout);
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     let task = connector_runtime()?.spawn(async move {
-        let result = tokio::time::timeout(CONNECT_TIMEOUT, async {
-            let addresses: Vec<_> = tokio::net::lookup_host(server.as_str()).await?.collect();
-            let stream = happy_eyeballs_connect(&addresses, CONNECT_TIMEOUT).await?;
+        let result = tokio::time::timeout(timeout, async {
+            let stream = dns.connect_server(&server, timeout).await?;
             stream.into_std()
         })
         .await
@@ -41,7 +40,7 @@ fn connect_proxy(server: String) -> io::Result<TcpStream> {
         .and_then(|result| result);
         let _ = sender.send(result);
     });
-    let stream = match receiver.recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(1)) {
+    let stream = match receiver.recv_timeout(timeout + Duration::from_secs(1)) {
         Ok(result) => result?,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             task.abort();
@@ -132,6 +131,7 @@ pub struct Client {
     password: String,
     tcp_timeout: Option<Duration>,
     udp_timeout: Option<Duration>,
+    dns: Arc<ClientDns>,
 }
 
 pub struct UdpAssociation {
@@ -166,6 +166,7 @@ impl Client {
             password,
             tcp_timeout: None,
             udp_timeout: Some(Duration::from_secs(60)),
+            dns: Arc::new(ClientDns::default()),
         })
     }
 
@@ -178,7 +179,8 @@ impl Client {
     }
 
     fn negotiate(&self) -> io::Result<TcpStream> {
-        let mut stream = connect_proxy(self.server.clone())?;
+        let mut stream =
+            connect_proxy(self.server.clone(), Arc::clone(&self.dns), CONNECT_TIMEOUT)?;
         // SOCKS5 协商使用多个小报文，关闭 Nagle 以减少交互等待
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
@@ -236,15 +238,14 @@ impl Client {
         let relay = normalize_udp_relay(match reply.host {
             Host::Ip(ip) if !ip.is_unspecified() => SocketAddr::new(ip, reply.port),
             Host::Ip(_) => SocketAddr::new(peer.ip(), reply.port),
-            Host::Domain(name) => resolve_udp_relay_with_timeout(
-                async move {
-                    Ok(tokio::net::lookup_host((name.as_str(), reply.port))
-                        .await?
-                        .collect())
-                },
-                bind.is_ipv4(),
-                CONNECT_TIMEOUT,
-            )?,
+            Host::Domain(name) => {
+                let dns = Arc::clone(&self.dns);
+                resolve_udp_relay_with_timeout(
+                    async move { dns.lookup(&name, reply.port, bind.is_ipv4()).await },
+                    bind.is_ipv4(),
+                    CONNECT_TIMEOUT,
+                )?
+            }
         });
         if relay.is_ipv4() != bind.is_ipv4() {
             let mut relay_bind = unspecified(relay.ip());
@@ -581,6 +582,164 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(1));
         cancellation.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn proxy_and_udp_timeouts_cancel_real_dns_queries() {
+        for proxy_lookup in [true, false] {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let dns = Arc::new(ClientDns::with_resolver(
+                crate::client_dns::tests::test_resolver(socket.local_addr().unwrap()),
+            ));
+            let server = thread::spawn(move || {
+                let mut sources = Vec::new();
+                let mut packet = [0; 4096];
+                for _ in 0..2 {
+                    let (_, source) = socket.recv_from(&mut packet).unwrap();
+                    sources.push(source);
+                }
+                (socket, sources)
+            });
+            let lookup_dns = Arc::clone(&dns);
+            let timeout = Duration::from_millis(150);
+            let result = if proxy_lookup {
+                connect_proxy("blackhole.example.:1080".into(), lookup_dns, timeout).map(|_| ())
+            } else {
+                resolve_udp_relay_with_timeout(
+                    async move { lookup_dns.lookup("blackhole.example.", 1080, true).await },
+                    true,
+                    timeout,
+                )
+                .map(|_| ())
+            };
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            let (socket, sources) = server.join().unwrap();
+            // 解析器仍保留在客户端中，超时查询本身必须关闭两个 DNS 请求的源端口。
+            let reclaimed: Vec<_> = sources
+                .into_iter()
+                .map(|source| {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                    loop {
+                        match UdpSocket::bind(source) {
+                            Ok(socket) => break socket,
+                            Err(error)
+                                if error.kind() == io::ErrorKind::AddrInUse
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("超时后未释放 DNS 源端口：{error}"),
+                        }
+                    }
+                })
+                .collect();
+            assert_eq!(reclaimed.len(), 2);
+            socket
+                .set_read_timeout(Some(Duration::from_millis(450)))
+                .unwrap();
+            let mut packet = [0; 4096];
+            let error = socket.recv_from(&mut packet).unwrap_err();
+            assert!([io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock].contains(&error.kind()));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_connects_while_other_dns_family_is_dropped() {
+        use crate::dns::tests::{DnsReply, scripted_dns};
+
+        for ipv4 in [true, false] {
+            let listener =
+                tokio::net::TcpListener::bind(if ipv4 { "127.0.0.42:0" } else { "[::1]:0" })
+                    .await
+                    .unwrap();
+            let replies = [DnsReply::Answer(Duration::ZERO), DnsReply::Drop];
+            let upstream = if ipv4 {
+                scripted_dns(replies[0], replies[1], 60).await
+            } else {
+                scripted_dns(replies[1], replies[0], 60).await
+            };
+            let dns = Arc::new(ClientDns::with_resolver(
+                crate::client_dns::tests::test_resolver(upstream.address),
+            ));
+            let address = listener.local_addr().unwrap();
+            let server = format!("available.example.:{}", address.port());
+            let stream = tokio::task::spawn_blocking(move || {
+                connect_proxy(server, dns, Duration::from_millis(700))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(stream.peer_addr().unwrap(), address);
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn udp_relay_uses_other_family_when_preferred_dns_family_is_dropped() {
+        use crate::dns::tests::{DnsReply, scripted_dns};
+
+        for ipv4 in [true, false] {
+            let upstream = if ipv4 {
+                scripted_dns(DnsReply::Answer(Duration::ZERO), DnsReply::Drop, 60).await
+            } else {
+                scripted_dns(DnsReply::Drop, DnsReply::Answer(Duration::ZERO), 60).await
+            };
+            let dns = Arc::new(ClientDns::with_resolver(
+                crate::client_dns::tests::test_resolver(upstream.address),
+            ));
+            let relay = tokio::task::spawn_blocking(move || {
+                resolve_udp_relay_with_timeout(
+                    async move { dns.lookup("available.example.", 1080, !ipv4).await },
+                    !ipv4,
+                    Duration::from_millis(700),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                relay,
+                if ipv4 {
+                    "127.0.0.42:1080".parse::<SocketAddr>().unwrap()
+                } else {
+                    "[::1]:1080".parse::<SocketAddr>().unwrap()
+                }
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_waits_for_late_dns_family_after_first_connection_fails() {
+        use crate::dns::tests::{DnsReply, scripted_dns};
+
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = scripted_dns(
+            DnsReply::Answer(Duration::ZERO),
+            DnsReply::Answer(Duration::from_millis(100)),
+            60,
+        )
+        .await;
+        let dns = Arc::new(ClientDns::with_resolver(
+            crate::client_dns::tests::test_resolver(upstream.address),
+        ));
+        let stream = tokio::task::spawn_blocking(move || {
+            connect_proxy(
+                format!("fallback.example.:{}", address.port()),
+                dns,
+                Duration::from_secs(1),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), address);
     }
 
     #[test]
