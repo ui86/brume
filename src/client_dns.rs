@@ -1,37 +1,68 @@
 use crate::dns::lookup_family;
 use crate::happy_eyeballs::{happy_eyeballs_connect, happy_eyeballs_connect_resolving};
-use hickory_resolver::config::{LookupIpStrategy, ResolveHosts};
+use hickory_resolver::Hosts;
+use hickory_resolver::config::{ResolveHosts, ResolverConfig, ResolverOpts};
 use hickory_resolver::lookup_ip::LookupIp;
 use hickory_resolver::proto::op::Query;
 use hickory_resolver::proto::rr::{Name, RecordType};
-use hickory_resolver::{Hosts, TokioResolver};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod transport;
+use transport::DnsWorkers;
 
 const SYSTEM_CONFIG_REFRESH: Duration = Duration::from_secs(60);
 const UDP_FAMILY_PREFERENCE: Duration = Duration::from_millis(50);
 
 enum LookupSource {
     Local(Vec<SocketAddr>),
-    Network(Arc<TokioResolver>),
+    Network(Arc<ResolverSnapshot>),
 }
 
-struct ResolverSnapshot {
-    resolver: Arc<TokioResolver>,
+#[derive(Clone)]
+pub(crate) struct ResolverSnapshot {
+    config: ResolverConfig,
+    options: ResolverOpts,
     hosts: Arc<Hosts>,
     loaded_at: Instant,
+    configuration_error: Option<Arc<io::Error>>,
+}
+
+impl ResolverSnapshot {
+    fn from_sources(
+        configuration: io::Result<(ResolverConfig, ResolverOpts)>,
+        hosts: Arc<Hosts>,
+    ) -> Self {
+        let (config, mut options, configuration_error) = match configuration {
+            Ok((config, options)) => (config, options, None),
+            Err(error) => (
+                ResolverConfig::from_name_servers(Vec::new()),
+                ResolverOpts::default(),
+                Some(Arc::new(error)),
+            ),
+        };
+        options.use_hosts_file = ResolveHosts::Never;
+        Self {
+            config,
+            options,
+            hosts,
+            loaded_at: Instant::now(),
+            configuration_error,
+        }
+    }
 }
 
 /// 客户端共享解析器，保留缓存，并定期重新读取系统 DNS 与 hosts 配置。
 #[derive(Default)]
 pub(crate) struct ClientDns {
-    snapshot: Mutex<Option<ResolverSnapshot>>,
+    snapshot: Mutex<Option<Arc<ResolverSnapshot>>>,
+    workers: DnsWorkers,
 }
 
 impl ClientDns {
-    fn resolver(&self) -> io::Result<(Arc<TokioResolver>, Arc<Hosts>)> {
+    fn configuration(&self) -> io::Result<Arc<ResolverSnapshot>> {
         let mut snapshot = self
             .snapshot
             .lock()
@@ -39,37 +70,32 @@ impl ClientDns {
         if let Some(current) = snapshot.as_ref()
             && current.loaded_at.elapsed() < SYSTEM_CONFIG_REFRESH
         {
-            return Ok((Arc::clone(&current.resolver), Arc::clone(&current.hosts)));
+            return Ok(Arc::clone(current));
         }
 
         // 只有本地系统配置与 hosts 文件读取是同步操作；网络查询使用可取消的异步套接字。
-        let mut builder = TokioResolver::builder_tokio().map_err(io::Error::other)?;
-        let options = builder.options_mut();
-        options.ip_strategy = LookupIpStrategy::Ipv6AndIpv4;
         // 显式共享同一份 hosts 快照，单族命中时直接返回，避免等待另一族的上游查询。
-        options.use_hosts_file = ResolveHosts::Never;
         let hosts = Arc::new(Hosts::from_system().unwrap_or_default());
-        let mut resolver = builder.build().map_err(io::Error::other)?;
-        resolver.set_hosts(Arc::clone(&hosts));
-        let resolver = Arc::new(resolver);
-        *snapshot = Some(ResolverSnapshot {
-            resolver: Arc::clone(&resolver),
-            hosts: Arc::clone(&hosts),
-            loaded_at: Instant::now(),
-        });
-        Ok((resolver, hosts))
+        let current = Arc::new(ResolverSnapshot::from_sources(
+            read_system_configuration(),
+            hosts,
+        ));
+        *snapshot = Some(Arc::clone(&current));
+        Ok(current)
     }
 
     fn lookup_source(&self, name: &str, port: u16) -> io::Result<LookupSource> {
         if let Ok(ip) = name.parse::<IpAddr>() {
             return Ok(LookupSource::Local(vec![SocketAddr::new(ip, port)]));
         }
-        let (resolver, hosts) = self.resolver()?;
+        let snapshot = self.configuration()?;
         if let Ok(host_name) = name.parse::<Name>() {
             let local_addresses: Vec<_> = [RecordType::AAAA, RecordType::A]
                 .into_iter()
                 .filter_map(|record_type| {
-                    hosts.lookup_static_host(&Query::query(host_name.clone(), record_type))
+                    snapshot
+                        .hosts
+                        .lookup_static_host(&Query::query(host_name.clone(), record_type))
                 })
                 .flat_map(|lookup| LookupIp::from(lookup).into_iter())
                 .map(|ip| SocketAddr::new(ip, port))
@@ -78,7 +104,13 @@ impl ClientDns {
                 return Ok(LookupSource::Local(local_addresses));
             }
         }
-        Ok(LookupSource::Network(resolver))
+        if let Some(error) = &snapshot.configuration_error {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("读取系统 DNS 配置失败：{error}"),
+            ));
+        }
+        Ok(LookupSource::Network(snapshot))
     }
 
     /// 先使用已返回的地址族，控制连接的地址族最多获得短暂的优先窗口。
@@ -88,12 +120,27 @@ impl ClientDns {
         port: u16,
         preferred_ipv4: bool,
     ) -> io::Result<Vec<SocketAddr>> {
-        let resolver = match self.lookup_source(name, port)? {
+        let snapshot = match self.lookup_source(name, port)? {
             LookupSource::Local(addresses) => return Ok(addresses),
-            LookupSource::Network(resolver) => resolver,
+            LookupSource::Network(snapshot) => snapshot,
         };
-        let preferred = lookup_family(&resolver, name, port, !preferred_ipv4);
-        let fallback = lookup_family(&resolver, name, port, preferred_ipv4);
+        let worker = self.workers.acquire(&snapshot, None).await?;
+        let result = self
+            .lookup_udp_with_worker(worker.resolver(), name, port, preferred_ipv4)
+            .await;
+        worker.finish().await;
+        result
+    }
+
+    async fn lookup_udp_with_worker(
+        &self,
+        resolver: &transport::ClientResolver,
+        name: &str,
+        port: u16,
+        preferred_ipv4: bool,
+    ) -> io::Result<Vec<SocketAddr>> {
+        let preferred = lookup_family(resolver, name, port, !preferred_ipv4);
+        let fallback = lookup_family(resolver, name, port, preferred_ipv4);
         tokio::pin!(preferred, fallback);
         tokio::select! {
             biased;
@@ -125,15 +172,28 @@ impl ClientDns {
         let (name, port) = server_parts(server)?;
         match self.lookup_source(name, port)? {
             LookupSource::Local(addresses) => happy_eyeballs_connect(&addresses, timeout).await,
-            LookupSource::Network(resolver) => {
+            LookupSource::Network(snapshot) => {
                 happy_eyeballs_connect_resolving(
-                    lookup_family(&resolver, name, port, true),
-                    lookup_family(&resolver, name, port, false),
+                    self.lookup_remote_family(&snapshot, name, port, true),
+                    self.lookup_remote_family(&snapshot, name, port, false),
                     timeout,
                 )
                 .await
             }
         }
+    }
+
+    async fn lookup_remote_family(
+        &self,
+        snapshot: &ResolverSnapshot,
+        name: &str,
+        port: u16,
+        ipv6: bool,
+    ) -> io::Result<Vec<SocketAddr>> {
+        let worker = self.workers.acquire(snapshot, Some(ipv6)).await?;
+        let result = lookup_family(worker.resolver(), name, port, ipv6).await;
+        worker.finish().await;
+        result
     }
 
     #[cfg(test)]
@@ -146,15 +206,22 @@ impl ClientDns {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_resolver(resolver: TokioResolver) -> Self {
+    pub(crate) fn with_resolver(snapshot: ResolverSnapshot) -> Self {
         Self {
-            snapshot: Mutex::new(Some(ResolverSnapshot {
-                resolver: Arc::new(resolver),
-                hosts: Arc::new(Hosts::default()),
-                loaded_at: Instant::now(),
-            })),
+            snapshot: Mutex::new(Some(Arc::new(snapshot))),
+            workers: DnsWorkers::default(),
         }
     }
+}
+
+fn read_system_configuration() -> io::Result<(ResolverConfig, ResolverOpts)> {
+    hickory_resolver::system_conf::read_system_conf().map_err(|error| {
+        #[cfg(all(unix, not(any(target_os = "android", target_vendor = "apple"))))]
+        if let hickory_resolver::net::NetError::Io(inner) = &error {
+            return io::Error::new(inner.kind(), error);
+        }
+        io::Error::other(error)
+    })
 }
 
 fn server_parts(server: &str) -> io::Result<(&str, u16)> {
@@ -179,11 +246,10 @@ pub(crate) mod tests {
     use hickory_resolver::config::{
         ConnectionConfig, NameServerConfig, ResolverConfig, ResolverOpts,
     };
-    use hickory_resolver::net::runtime::TokioRuntimeProvider;
     use std::sync::Arc;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    pub(crate) fn test_resolver(address: SocketAddr) -> TokioResolver {
+    pub(crate) fn test_resolver(address: SocketAddr) -> ResolverSnapshot {
         let mut connection = ConnectionConfig::udp();
         connection.port = address.port();
         let mut tcp = ConnectionConfig::tcp();
@@ -193,14 +259,17 @@ pub(crate) mod tests {
             true,
             vec![connection, tcp],
         )]);
-        let mut builder =
-            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
-        let options: &mut ResolverOpts = builder.options_mut();
+        let mut options = ResolverOpts::default();
         options.use_hosts_file = ResolveHosts::Never;
-        options.ip_strategy = LookupIpStrategy::Ipv6AndIpv4;
         options.timeout = Duration::from_secs(5);
         options.attempts = 3;
-        builder.build().unwrap()
+        ResolverSnapshot {
+            config,
+            options,
+            hosts: Arc::new(Hosts::default()),
+            loaded_at: Instant::now(),
+            configuration_error: None,
+        }
     }
 
     fn answer(query: &[u8]) -> (Vec<u8>, u16) {
@@ -273,6 +342,71 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn hosts_remain_available_when_dns_configuration_is_missing_or_unreadable() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+        ] {
+            let mut hosts = Hosts::default();
+            hosts
+                .read_hosts_conf(b"127.0.0.7 hosts-only.example localhost\n".as_slice())
+                .unwrap();
+            let dns = ClientDns::with_resolver(ResolverSnapshot::from_sources(
+                Err(io::Error::new(kind, "系统 DNS 配置不可用")),
+                Arc::new(hosts),
+            ));
+            assert_eq!(
+                dns.lookup("hosts-only.example", 1080, true).await.unwrap(),
+                vec!["127.0.0.7:1080".parse().unwrap()]
+            );
+            assert_eq!(
+                dns.lookup("external.example", 1080, true)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                kind
+            );
+            assert_eq!(
+                dns.connect_server("external.example:1080", Duration::from_secs(1))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                kind
+            );
+            assert_eq!(dns.workers.available_slots(), (16, 32));
+        }
+    }
+
+    #[tokio::test]
+    async fn consecutive_proxy_connections_reuse_both_family_dns_caches() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns = ClientDns::with_resolver(test_resolver(socket.local_addr().unwrap()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.42:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let mut packet = [0; 4096];
+            for _ in 0..2 {
+                let (length, source) = socket.recv_from(&mut packet).await.unwrap();
+                socket
+                    .send_to(&answer(&packet[..length]).0, source)
+                    .await
+                    .unwrap();
+            }
+        });
+        let server = format!("cached-proxy.example.:{}", address.port());
+        for _ in 0..3 {
+            let stream = dns
+                .connect_server(&server, Duration::from_millis(500))
+                .await
+                .unwrap();
+            assert_eq!(stream.peer_addr().unwrap(), address);
+            listener.accept().await.unwrap();
+        }
+        upstream.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn honors_hosts_aliases_before_querying_dns() {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut resolver = test_resolver(socket.local_addr().unwrap());
@@ -281,9 +415,9 @@ pub(crate) mod tests {
             .read_hosts_conf("127.0.0.7 hosts-only.example alias.example\n::7 hosts-only.example alias.example\n".as_bytes())
             .unwrap();
         let hosts = Arc::new(hosts);
-        resolver.set_hosts(Arc::clone(&hosts));
+        resolver.hosts = Arc::clone(&hosts);
         let dns = ClientDns::with_resolver(resolver);
-        dns.snapshot.lock().unwrap().as_mut().unwrap().hosts = hosts;
+        Arc::make_mut(dns.snapshot.lock().unwrap().as_mut().unwrap()).hosts = hosts;
         for name in ["hosts-only.example", "alias.example"] {
             let addresses =
                 tokio::time::timeout(Duration::from_secs(1), dns.lookup(name, 1080, true))
@@ -306,7 +440,7 @@ pub(crate) mod tests {
             hosts
                 .read_hosts_conf(format!("{ip} hosts-only.example\n").as_bytes())
                 .unwrap();
-            dns.snapshot.lock().unwrap().as_mut().unwrap().hosts = Arc::new(hosts);
+            Arc::make_mut(dns.snapshot.lock().unwrap().as_mut().unwrap()).hosts = Arc::new(hosts);
             assert_eq!(
                 tokio::time::timeout(
                     Duration::from_secs(1),
@@ -441,13 +575,7 @@ pub(crate) mod tests {
         assert!(lookup.await.unwrap().is_err());
         udp_worker.await.unwrap();
         let mut packet = [0; 4096];
-        assert!(
-            tokio::time::timeout(Duration::from_millis(450), stream.read(&mut packet))
-                .await
-                .is_err()
-        );
-        // 客户端存活时可保留闲置连接；最后一个解析器所有者释放后必须关闭连接。
-        drop(dns);
+        // 客户端继续存活，超时本身也必须关闭后台 TCP 查询连接。
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), stream.read(&mut packet))
                 .await
@@ -455,5 +583,249 @@ pub(crate) mod tests {
                 .unwrap(),
             0
         );
+
+        let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+        let udp_worker = tokio::spawn(async move {
+            let mut packet = [0; 4096];
+            for _ in 0..2 {
+                let (length, source) = udp.recv_from(&mut packet).await.unwrap();
+                let (mut response, record_type) = answer(&packet[..length]);
+                if record_type == 1 {
+                    response[2] |= 0x02;
+                }
+                response[7] = 0;
+                let mut end = 12;
+                while packet[end] != 0 {
+                    end += usize::from(packet[end]) + 1;
+                }
+                response.truncate(end + 5);
+                udp.send_to(&response, source).await.unwrap();
+            }
+        });
+        let next_dns = Arc::clone(&dns);
+        let recovered = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                next_dns.lookup("recovered.example.", 1080, true),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        let (mut connection, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let length = connection.read_u16().await.unwrap();
+        let mut query = vec![0; usize::from(length)];
+        connection.read_exact(&mut query).await.unwrap();
+        let response = answer(&query).0;
+        connection.write_u16(response.len() as u16).await.unwrap();
+        connection.write_all(&response).await.unwrap();
+        assert_eq!(
+            recovered.await.unwrap(),
+            vec!["127.0.0.42:1080".parse().unwrap()]
+        );
+        udp_worker.await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), connection.read(&mut packet))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        // 未缓存域名重新建连成功后，上游关闭，重复查询仍必须命中同一 worker 的缓存。
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                dns.lookup("recovered.example.", 1080, true),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            vec!["127.0.0.42:1080".parse().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_dns_calls_cancel_without_stopping_active_workers() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns = Arc::new(ClientDns::with_resolver(test_resolver(
+            socket.local_addr().unwrap(),
+        )));
+        let mut active = Vec::new();
+        for index in 0..16 {
+            let dns = Arc::clone(&dns);
+            active.push(tokio::spawn(async move {
+                dns.lookup(&format!("active-{index}.example."), 1080, true)
+                    .await
+            }));
+        }
+        let mut requests = Vec::new();
+        let mut packet = [0; 4096];
+        for _ in 0..32 {
+            let (length, source) =
+                tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut packet))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            requests.push((packet[..length].to_vec(), source));
+        }
+        assert_eq!(dns.workers.available_slots().0, 0);
+        let mut queued = Vec::new();
+        for index in 0..16 {
+            let dns = Arc::clone(&dns);
+            queued.push(tokio::spawn(async move {
+                dns.lookup(&format!("queued-{index}.example."), 1080, true)
+                    .await
+            }));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), socket.recv_from(&mut packet))
+                .await
+                .is_err()
+        );
+        for task in queued {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert!(active.iter().all(|task| !task.is_finished()));
+        for (request, source) in requests {
+            socket.send_to(&answer(&request).0, source).await.unwrap();
+        }
+        for task in active {
+            let addresses = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(addresses.contains(&"127.0.0.42:1080".parse().unwrap()));
+        }
+        assert_eq!(dns.workers.available_slots(), (16, 32));
+    }
+
+    #[tokio::test]
+    async fn configuration_refresh_replaces_workers_without_reusing_old_dns_cache() {
+        async fn upstream(last_octet: u8) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let mut packet = [0; 4096];
+                for _ in 0..2 {
+                    let (length, source) = socket.recv_from(&mut packet).await.unwrap();
+                    let (mut response, record_type) = answer(&packet[..length]);
+                    if record_type == 1 {
+                        *response.last_mut().unwrap() = last_octet;
+                    }
+                    socket.send_to(&response, source).await.unwrap();
+                }
+            });
+            (address, task)
+        }
+
+        let (old_address, old_server) = upstream(42).await;
+        let dns = ClientDns::with_resolver(test_resolver(old_address));
+        assert_eq!(
+            dns.lookup("refreshed.example.", 1080, true).await.unwrap(),
+            vec!["127.0.0.42:1080".parse().unwrap()]
+        );
+        old_server.await.unwrap();
+        let (new_address, new_server) = upstream(43).await;
+        *dns.snapshot.lock().unwrap() = Some(Arc::new(test_resolver(new_address)));
+        assert_eq!(
+            dns.lookup("refreshed.example.", 1080, true).await.unwrap(),
+            vec!["127.0.0.43:1080".parse().unwrap()]
+        );
+        new_server.await.unwrap();
+        assert_eq!(dns.workers.available_slots(), (16, 32));
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_sockets_remain_bounded_during_refresh_and_cancellation() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        let second = tokio::net::TcpListener::bind(("127.0.0.2", port))
+            .await
+            .unwrap();
+        let addresses = [first.local_addr().unwrap(), second.local_addr().unwrap()];
+        let mut snapshot = test_resolver(addresses[0]);
+        snapshot
+            .config
+            .name_servers
+            .extend(test_resolver(addresses[1]).config.name_servers);
+        // 直接配置两台 TCP DNS 上游，隔离 UDP 截断策略并制造超过 32 条连接的需求。
+        for server in &mut snapshot.config.name_servers {
+            server.connections.retain(|connection| {
+                matches!(
+                    connection.protocol,
+                    hickory_resolver::config::ProtocolConfig::Tcp
+                )
+            });
+        }
+        let dns = Arc::new(ClientDns::with_resolver(snapshot));
+        let mut active = Vec::new();
+        for index in 0..16 {
+            let dns = Arc::clone(&dns);
+            active.push(tokio::spawn(async move {
+                dns.lookup(&format!("tcp-load-{index}.example."), 1080, true)
+                    .await
+            }));
+        }
+        let mut connections = Vec::new();
+        for _ in 0..32 {
+            let accepted = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    accepted = first.accept() => accepted,
+                    accepted = second.accept() => accepted,
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("实际已接受 {} 条 DNS TCP 连接", connections.len()))
+            .unwrap();
+            connections.push(accepted.0);
+        }
+        assert_eq!(dns.workers.available_slots(), (0, 0));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), async {
+                tokio::select! {
+                    accepted = first.accept() => accepted,
+                    accepted = second.accept() => accepted,
+                }
+            })
+            .await
+            .is_err()
+        );
+
+        // 旧代尚持有全部配额时刷新配置，新代查询只能排队，不能创建另一组连接池。
+        *dns.snapshot.lock().unwrap() = Some(Arc::new(test_resolver(addresses[0])));
+        let queued_dns = Arc::clone(&dns);
+        let queued = tokio::spawn(async move {
+            queued_dns
+                .lookup("next-generation.example.", 1080, true)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(dns.workers.available_slots(), (0, 0));
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        for task in active {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        for mut connection in connections {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut packet = [0; 4096];
+                while connection.read(&mut packet).await.unwrap() != 0 {}
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dns.workers.available_slots() != (16, 32) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

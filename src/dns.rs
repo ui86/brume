@@ -1,11 +1,11 @@
 use crate::happy_eyeballs::{happy_eyeballs_connect, happy_eyeballs_connect_resolving};
 use crate::protocol::{Host, Target};
-use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
     ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts,
 };
 use hickory_resolver::lookup_ip::LookupIp;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::{ConnectionProvider, Resolver, TokioResolver};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -103,17 +103,15 @@ impl DnsResolver {
         let Host::Domain(name) = &target.host else {
             unreachable!()
         };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let make_lookup = |ipv6| {
             let resolver = self.resolver.clone();
             let name = name.clone();
             let port = target.port;
             Box::pin(async move {
-                tokio::time::timeout(
-                    Duration::from_secs(10),
-                    lookup_family(&resolver, &name, port, ipv6),
-                )
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP 目标域名解析超时"))?
+                tokio::time::timeout_at(deadline, lookup_family(&resolver, &name, port, ipv6))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP 目标域名解析超时"))?
             }) as PendingLookup
         };
         let mut ipv6 = make_lookup(true);
@@ -192,8 +190,8 @@ impl DnsResolver {
     }
 }
 
-pub(crate) async fn lookup_family(
-    resolver: &TokioResolver,
+pub(crate) async fn lookup_family<P: ConnectionProvider>(
+    resolver: &Resolver<P>,
     name: &str,
     port: u16,
     ipv6: bool,
