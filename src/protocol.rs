@@ -5,6 +5,7 @@ pub const CONNECT: u8 = 1;
 pub const UDP_ASSOCIATE: u8 = 3;
 pub const SUCCESS: u8 = 0;
 pub const SERVER_FAILURE: u8 = 1;
+pub const CONNECTION_NOT_ALLOWED: u8 = 2;
 pub const HOST_UNREACHABLE: u8 = 4;
 pub const CONNECTION_REFUSED: u8 = 5;
 pub const COMMAND_UNSUPPORTED: u8 = 7;

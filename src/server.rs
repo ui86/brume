@@ -29,44 +29,26 @@ type Associations = Arc<Mutex<AssociationRegistry>>;
 struct AssociationRegistry {
     entries: HashMap<u64, Arc<Association>>,
     endpoints: HashMap<SocketAddr, u64>,
-    pending: HashMap<IpAddr, u64>,
 }
 
 impl AssociationRegistry {
     fn insert(&mut self, id: u64, association: Arc<Association>) -> bool {
         let ip = normalize(association.client_ip);
-        if association.requested_port == 0 {
-            if self.pending.contains_key(&ip) {
-                return false;
-            }
-            self.pending.insert(ip, id);
-        } else {
-            let endpoint = SocketAddr::new(ip, association.requested_port);
-            if self.endpoints.contains_key(&endpoint) {
-                return false;
-            }
-            self.endpoints.insert(endpoint, id);
+        let endpoint = SocketAddr::new(ip, association.requested_port);
+        if association.requested_port == 0 || self.endpoints.contains_key(&endpoint) {
+            return false;
         }
+        self.endpoints.insert(endpoint, id);
         self.entries.insert(id, association);
         true
     }
 
-    fn find(&mut self, source: SocketAddr) -> Option<Arc<Association>> {
+    fn find(&self, source: SocketAddr) -> Option<Arc<Association>> {
         let endpoint = endpoint_key(source);
-        if let Some(id) = self.endpoints.get(&endpoint) {
-            let association = self.entries.get(id)?.clone();
-            return (association.alive.load(Ordering::Relaxed) && association.accepts(source))
-                .then_some(association);
-        }
-        let ip = normalize(source.ip());
-        let id = *self.pending.get(&ip)?;
-        let association = self.entries.get(&id)?.clone();
-        if !association.alive.load(Ordering::Relaxed) || !association.accepts(source) {
-            return None;
-        }
-        self.pending.remove(&ip);
-        self.endpoints.insert(endpoint, id);
-        Some(association)
+        let id = self.endpoints.get(&endpoint)?;
+        let association = self.entries.get(id)?.clone();
+        (association.alive.load(Ordering::Relaxed) && association.accepts(source))
+            .then_some(association)
     }
 
     fn remove(&mut self, id: u64) {
@@ -74,17 +56,9 @@ impl AssociationRegistry {
             return;
         };
         let ip = normalize(association.client_ip);
-        let endpoint = if association.requested_port != 0 {
-            Some(SocketAddr::new(ip, association.requested_port))
-        } else {
-            association.endpoint.lock().unwrap().map(endpoint_key)
-        };
-        if let Some(endpoint) = endpoint {
-            if self.endpoints.get(&endpoint) == Some(&id) {
-                self.endpoints.remove(&endpoint);
-            }
-        } else if self.pending.get(&ip) == Some(&id) {
-            self.pending.remove(&ip);
+        let endpoint = SocketAddr::new(ip, association.requested_port);
+        if self.endpoints.get(&endpoint) == Some(&id) {
+            self.endpoints.remove(&endpoint);
         }
     }
 }
@@ -102,7 +76,8 @@ struct Association {
 impl Association {
     fn accepts(&self, source: SocketAddr) -> bool {
         if normalize(source.ip()) != normalize(self.client_ip)
-            || (self.requested_port != 0 && self.requested_port != source.port())
+            || self.requested_port == 0
+            || self.requested_port != source.port()
         {
             return false;
         }
@@ -584,6 +559,15 @@ async fn associate(
     shutdown: CancellationToken,
 ) -> io::Result<()> {
     let peer = stream.peer_addr()?;
+    if target.port == 0 {
+        // 共享中继无法验证同源 IP 的首包归属，必须在认证后的控制连接声明实际端口。
+        let address = unspecified(stream.local_addr()?.ip());
+        protocol::write_reply_async(&mut stream, protocol::CONNECTION_NOT_ALLOWED, address).await?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "UDP 关联必须声明非零客户端端口",
+        ));
+    }
     match target.host {
         Host::Ip(ip) if !ip.is_unspecified() && normalize(ip) != normalize(peer.ip()) => {
             let address = unspecified(stream.local_addr()?.ip());
@@ -1060,6 +1044,33 @@ mod tests {
         assert!(Server::bind(config, CancellationToken::new()).is_err());
     }
 
+    #[test]
+    fn udp_association_rejects_unspecified_client_port() {
+        let (proxy, shutdown, server_thread) = start_server("", "", "127.0.0.1,::1");
+        for host in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let mut client = TcpStream::connect(SocketAddr::new(host, proxy.port())).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            assert_eq!(negotiate_client(&mut client, 0), [5, 0]);
+            let reply = request(
+                &mut client,
+                protocol::UDP_ASSOCIATE,
+                SocketAddr::new(host, 0),
+            );
+            assert_eq!(
+                reply[1],
+                protocol::CONNECTION_NOT_ALLOWED,
+                "未声明客户端端口的关联必须被拒绝"
+            );
+        }
+        shutdown.cancel();
+        server_thread.join().unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn blocking_server_rejects_current_thread_runtime() {
         let server = Server::bind(test_config(), CancellationToken::new()).unwrap();
@@ -1130,14 +1141,26 @@ mod tests {
         let mut control = tokio::net::TcpStream::connect(proxy).await.unwrap();
         control.write_all(&[5, 1, 0]).await.unwrap();
         control.read_exact(&mut reply).await.unwrap();
+        let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = client_udp.local_addr().unwrap().port().to_be_bytes();
         control
-            .write_all(&[5, protocol::UDP_ASSOCIATE, 0, 1, 0, 0, 0, 0, 0, 0])
+            .write_all(&[
+                5,
+                protocol::UDP_ASSOCIATE,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                port[0],
+                port[1],
+            ])
             .await
             .unwrap();
         let mut association_reply = [0; 10];
         control.read_exact(&mut association_reply).await.unwrap();
         assert_eq!(association_reply[1], protocol::SUCCESS);
-        let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let remote = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client_udp
             .send_to(
@@ -1177,14 +1200,13 @@ mod tests {
     }
 
     #[test]
-    fn udp_registry_matches_ports_and_rejects_ambiguous_pending_associations() {
+    fn udp_registry_requires_declared_ports_and_isolates_clients() {
         let mut registry = AssociationRegistry::default();
         let first = test_association(40001);
         let second = test_association(40002);
-        let pending = test_association(0);
         assert!(registry.insert(1, Arc::clone(&first)));
         assert!(registry.insert(2, Arc::clone(&second)));
-        assert!(registry.insert(3, Arc::clone(&pending)));
+        assert!(!registry.insert(3, test_association(0)));
         assert!(!registry.insert(4, test_association(0)));
         assert!(!registry.insert(5, test_association(40001)));
         assert!(Arc::ptr_eq(
@@ -1201,13 +1223,11 @@ mod tests {
             &registry.find("127.0.0.1:40002".parse().unwrap()).unwrap(),
             &second
         ));
-        assert!(Arc::ptr_eq(
-            &registry.find("127.0.0.1:40003".parse().unwrap()).unwrap(),
-            &pending
-        ));
-        registry.remove(3);
         assert!(registry.find("127.0.0.1:40003".parse().unwrap()).is_none());
-        assert!(registry.insert(4, test_association(0)));
+        registry.remove(1);
+        assert!(registry.find("127.0.0.1:40001".parse().unwrap()).is_none());
+        assert!(registry.find("127.0.0.1:40003".parse().unwrap()).is_none());
+        assert!(registry.insert(4, test_association(40001)));
     }
 
     async fn test_udp_flow() -> (
@@ -1457,10 +1477,17 @@ mod tests {
         let reply = request(
             &mut control,
             protocol::UDP_ASSOCIATE,
-            "0.0.0.0:0".parse().unwrap(),
+            client_udp.local_addr().unwrap(),
         );
         assert_eq!(reply[1], protocol::SUCCESS);
         let relay = SocketAddr::new(proxy.ip(), u16::from_be_bytes([reply[8], reply[9]]));
+        // 同一 IP 的其他端口不能抢占已认证控制连接声明的端点。
+        let other_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        other_udp
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        other_udp.send_to(&packet, relay).unwrap();
+        assert!(other_udp.recv_from(&mut [0; 100]).is_err());
         client_udp.send_to(&packet, relay).unwrap();
         client_udp
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -1499,6 +1526,8 @@ mod tests {
         });
         let (proxy, shutdown, server_thread) = start_server("", "", "::1");
         let proxy = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), proxy.port());
+        let client_udp = UdpSocket::bind("[::1]:0").unwrap();
+        let client_port = client_udp.local_addr().unwrap().port().to_be_bytes();
         let mut control = TcpStream::connect(proxy).unwrap();
         control
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1528,11 +1557,11 @@ mod tests {
             0,
             0,
         ];
+        request[20..22].copy_from_slice(&client_port);
         control.write_all(&request).unwrap();
         control.read_exact(&mut request).unwrap();
         assert_eq!(request[1], protocol::SUCCESS);
         let relay = SocketAddr::new(proxy.ip(), u16::from_be_bytes([request[20], request[21]]));
-        let client_udp = UdpSocket::bind("[::1]:0").unwrap();
         client_udp
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
