@@ -14,6 +14,12 @@ pub struct Config {
     pub dns_servers: Vec<SocketAddr>,
 }
 
+#[derive(Debug)]
+pub enum Command {
+    Serve(Config),
+    CheckConfig(Config),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Whitelist {
     addresses: Vec<IpAddr>,
@@ -101,13 +107,24 @@ fn prefix_matches(network: IpAddr, address: IpAddr, bits: u8) -> bool {
 
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Self>, String> {
+        Self::parse_command(args).map(|command| {
+            command.map(|command| match command {
+                Command::Serve(config) | Command::CheckConfig(config) => config,
+            })
+        })
+    }
+
+    pub fn parse_command(
+        args: impl IntoIterator<Item = String>,
+    ) -> Result<Option<Command>, String> {
         let mut args = args.into_iter();
         let mut config_path = None;
         let mut overrides = Vec::new();
+        let mut check_config = false;
         while let Some(arg) = args.next() {
             if matches!(arg.as_str(), "-h" | "--help") {
                 println!(
-                    "brume {}\n用法：brume [--config 文件] [-p 端口] [-user 用户名 -pwd 密码] [--whitelist IP或CIDR,...] [--tcp-timeout 秒] [--udp-timeout 秒] [--dns-servers IP,IP]",
+                    "brume {}\n用法：brume [--check-config] [--config 文件] [-p 端口] [-user 用户名 -pwd 密码] [--whitelist IP或CIDR,...] [--tcp-timeout 秒] [--udp-timeout 秒] [--dns-servers IP,IP]\n--check-config：仅校验完整配置后退出，不监听端口",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(None);
@@ -115,6 +132,10 @@ impl Config {
             if arg == "--version" {
                 println!("brume {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
+            }
+            if arg == "--check-config" {
+                check_config = true;
+                continue;
             }
             let (key, inline) = arg
                 .split_once('=')
@@ -167,7 +188,11 @@ impl Config {
             config.apply_value(&key, &value)?;
         }
         config.validate()?;
-        Ok(Some(config))
+        Ok(Some(if check_config {
+            Command::CheckConfig(config)
+        } else {
+            Command::Serve(config)
+        }))
     }
 
     fn read_file(&mut self, path: &Path) -> Result<(), String> {
@@ -357,6 +382,24 @@ mod tests {
         config.tcp_timeout = None;
         config.udp_timeout = Duration::from_secs(u64::MAX);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn check_mode_respects_option_value_boundaries() {
+        let command = Config::parse_command(
+            ["--user", "admin", "--pwd", "--check-config"].map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        let Command::Serve(config) = command else {
+            panic!("密码中的参数字面值不应改变运行模式");
+        };
+        assert_eq!(config.password, "--check-config");
+        assert!(matches!(
+            Config::parse_command(["--check-config".to_owned()]).unwrap(),
+            Some(Command::CheckConfig(_))
+        ));
+        assert!(Config::parse_command(["--check-config=true".to_owned()]).is_err());
     }
 
     #[test]

@@ -1,11 +1,18 @@
-use brume::config::Config;
+use brume::config::{Command, Config};
 use brume::server::Server;
 use std::error::Error;
 use tokio_util::sync::CancellationToken;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let Some(config) = Config::parse(std::env::args().skip(1))? else {
+    let Some(command) = Config::parse_command(std::env::args().skip(1))? else {
         return Ok(());
+    };
+    let config = match command {
+        Command::CheckConfig(_) => {
+            println!("配置校验通过");
+            return Ok(());
+        }
+        Command::Serve(config) => config,
     };
     if config.whitelist.is_empty() {
         eprintln!("警告：白名单为空，所有 IP 均可连接");
