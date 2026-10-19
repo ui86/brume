@@ -439,7 +439,7 @@ schedule_upgrade_restart() (
     transaction_dir=$(mktemp -d "${CONFIG_DIR}/.upgrade.XXXXXX") || return 1
     trap 'if [ "${scheduled}" != true ] && [ ! -f "${transaction_dir}/go" ]; then cleanup_modify_transaction "${transaction_dir}"; fi' EXIT
     cp -- "${BASH_SOURCE[0]}" "${transaction_dir}/installer.sh" || return 1
-    log_file=$(mktemp "${CONFIG_DIR}/upgrade.XXXXXX.log") || return 1
+    log_file=$(mktemp "${CONFIG_DIR}/upgrade.log.XXXXXX") || return 1
     schedule_independent_worker "${transaction_dir}" "${init_system}" "${log_file}" --restart-upgrade || return 1
     scheduled=true
     echo "正在安排服务重启；经过 Brume 的 SSH 连接可能短暂断开，请稍后重连。"
@@ -1371,7 +1371,7 @@ modify() (
             && touch "${transaction_dir}/had-config" || return 1
     fi
     cp -- "${BASH_SOURCE[0]}" "${transaction_dir}/installer.sh" || return 1
-    log_file=$(mktemp "${CONFIG_DIR}/modify.XXXXXX.log") || return 1
+    log_file=$(mktemp "${CONFIG_DIR}/modify.log.XXXXXX") || return 1
     schedule_modify_apply "${transaction_dir}" "${init_system}" "${log_file}" || return 1
     scheduled=true
     echo "已安排独立进程应用配置；经过 Brume 的 SSH 连接可能短暂断开，请稍后重连。"

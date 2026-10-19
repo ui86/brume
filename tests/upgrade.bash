@@ -4,6 +4,18 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "${script_dir}/../install.sh"
 
+# 按 BusyBox 的模板规则限制替身，使 GNU mktemp 环境也能发现后缀不兼容。
+mktemp() {
+    if [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = -d ]; } \
+        || { [ "$#" -eq 1 ] && [[ "$1" == *XXXXXX ]]; } \
+        || { [ "$#" -eq 2 ] && [ "$1" = -d ] && [[ "$2" == *XXXXXX ]]; }; then
+        command mktemp "$@"
+    else
+        echo '临时文件模板必须以 XXXXXX 结尾' >&2
+        return 1
+    fi
+}
+
 CONFIG_DIR=$(mktemp -d)
 CONFIG_FILE="${CONFIG_DIR}/brume.conf"
 test_config_dir=${CONFIG_DIR}
@@ -11,7 +23,7 @@ events="${CONFIG_DIR}/events"
 touch "${CONFIG_FILE}" "${events}"
 cleanup() {
     rm -f -- "${CONFIG_FILE}" "${events}"
-    rm -f -- "${CONFIG_DIR}"/upgrade.*.log
+    rm -f -- "${CONFIG_DIR}"/upgrade.log.*
     rmdir -- "${CONFIG_DIR}"
 }
 trap cleanup EXIT
