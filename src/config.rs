@@ -22,8 +22,42 @@ pub enum Command {
 
 #[derive(Clone, Debug, Default)]
 pub struct Whitelist {
-    addresses: Vec<IpAddr>,
-    networks: Vec<(IpAddr, u8)>,
+    ipv4: Vec<(u32, u32)>,
+    ipv6: Vec<(u128, u128)>,
+}
+
+fn merge_ranges<T: Copy + Ord>(
+    mut ranges: Vec<(T, T)>,
+    successor: impl Fn(T) -> Option<T>,
+) -> Vec<(T, T)> {
+    ranges.sort_unstable();
+    let mut merged = 0;
+    for position in 0..ranges.len() {
+        let (start, end) = ranges[position];
+        if let Some(previous) = ranges[..merged].last_mut()
+            && (start <= previous.1 || successor(previous.1) == Some(start))
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            ranges[merged] = (start, end);
+            merged += 1;
+        }
+    }
+    ranges.truncate(merged);
+    ranges.shrink_to_fit();
+    ranges
+}
+
+#[inline]
+fn range_contains<T: Copy + Ord>(ranges: &[(T, T)], address: T) -> bool {
+    // 少量范围直接比较，避免小名单承担二分查找的循环开销。
+    if ranges.len() <= 4 {
+        return ranges
+            .iter()
+            .any(|&(start, end)| start <= address && address <= end);
+    }
+    let position = ranges.partition_point(|range| range.0 <= address);
+    position > 0 && address <= ranges[position - 1].1
 }
 
 impl Whitelist {
@@ -50,34 +84,58 @@ impl Whitelist {
                     }
                     _ => (ip, bits),
                 };
-                result.networks.push((ip, bits));
+                result.push(ip, bits);
             } else {
                 let ip = entry
                     .parse()
                     .map_err(|_| format!("无效的白名单地址：{entry}"))?;
-                result.addresses.push(normalize(ip));
+                let ip = normalize(ip);
+                result.push(ip, if ip.is_ipv4() { 32 } else { 128 });
             }
         }
         if !value.trim().is_empty() && result.is_empty() {
             return Err("白名单至少需要一个有效的 IP 或网段".into());
         }
+        // 配置加载时合并重叠和相邻范围，连接检查只检索对应地址族的范围。
+        result.ipv4 = merge_ranges(result.ipv4, |value| value.checked_add(1));
+        result.ipv6 = merge_ranges(result.ipv6, |value| value.checked_add(1));
         Ok(result)
     }
 
+    fn push(&mut self, address: IpAddr, bits: u8) {
+        match address {
+            IpAddr::V4(address) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(bits)).unwrap_or(0);
+                let start = u32::from(address) & mask;
+                self.ipv4.push((start, start | !mask));
+            }
+            IpAddr::V6(address) => {
+                let mask = u128::MAX.checked_shl(128 - u32::from(bits)).unwrap_or(0);
+                let start = u128::from(address) & mask;
+                self.ipv6.push((start, start | !mask));
+            }
+        }
+    }
+
+    #[inline]
     pub fn allows(&self, address: IpAddr) -> bool {
-        if self.addresses.is_empty() && self.networks.is_empty() {
+        if self.is_empty() {
             return true;
         }
-        let normalized = normalize(address);
-        self.addresses.contains(&normalized)
-            || self.networks.iter().any(|(network, bits)| {
-                prefix_matches(*network, normalized, *bits)
-                    || prefix_matches(*network, address, *bits)
-            })
+        match address {
+            IpAddr::V4(address) => range_contains(&self.ipv4, u32::from(address)),
+            IpAddr::V6(address) => {
+                // 原始 IPv6 仍参与匹配，保留宽网段对映射地址的兼容行为。
+                address
+                    .to_ipv4_mapped()
+                    .is_some_and(|address| range_contains(&self.ipv4, u32::from(address)))
+                    || range_contains(&self.ipv6, u128::from(address))
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.addresses.is_empty() && self.networks.is_empty()
+        self.ipv4.is_empty() && self.ipv6.is_empty()
     }
 }
 
@@ -91,6 +149,7 @@ fn normalize(address: IpAddr) -> IpAddr {
     }
 }
 
+#[cfg(test)]
 fn prefix_matches(network: IpAddr, address: IpAddr, bits: u8) -> bool {
     match (network, address) {
         (IpAddr::V4(a), IpAddr::V4(b)) => {
@@ -311,6 +370,169 @@ mod tests {
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn assert_whitelist_matches_linear(value: &str, addresses: impl IntoIterator<Item = IpAddr>) {
+        let whitelist = Whitelist::parse(value).unwrap();
+        // 保留原逐项匹配算法作为参照，不依赖范围构建和二分查找实现。
+        let rules = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                if let Some((address, bits)) = entry.split_once('/') {
+                    let address: IpAddr = address.parse().unwrap();
+                    let bits: u8 = bits.parse().unwrap();
+                    match address {
+                        IpAddr::V6(address) if bits >= 96 && address.to_ipv4_mapped().is_some() => {
+                            (IpAddr::V4(address.to_ipv4_mapped().unwrap()), bits - 96)
+                        }
+                        _ => (address, bits),
+                    }
+                } else {
+                    let address = normalize(entry.parse().unwrap());
+                    (address, if address.is_ipv4() { 32 } else { 128 })
+                }
+            })
+            .collect::<Vec<_>>();
+        for address in addresses {
+            let normalized = normalize(address);
+            let expected = rules.is_empty()
+                || rules.iter().any(|(network, bits)| {
+                    prefix_matches(*network, normalized, *bits)
+                        || prefix_matches(*network, address, *bits)
+                });
+            assert_eq!(whitelist.allows(address), expected, "{value}: {address}");
+        }
+    }
+
+    #[test]
+    fn whitelist_merges_ranges_without_allowing_gaps() {
+        let whitelist = Whitelist::parse(
+            "192.0.2.127/25,192.0.2.128/25,192.0.2.64/26,192.0.3.0/24,192.0.5.0/24,2001:db8::1/127,2001:db8::2/127,2001:db8::8/127",
+        )
+        .unwrap();
+        assert_eq!(whitelist.ipv4.len(), 2);
+        assert_eq!(whitelist.ipv6.len(), 2);
+        for address in ["192.0.2.0", "192.0.3.255", "2001:db8::", "2001:db8::3"] {
+            assert!(whitelist.allows(address.parse().unwrap()), "{address}");
+        }
+        for address in ["192.0.1.255", "192.0.4.0", "2001:db8::4", "2001:db8::7"] {
+            assert!(!whitelist.allows(address.parse().unwrap()), "{address}");
+        }
+        let maximum = Whitelist::parse(
+            "255.255.255.255/32,255.255.255.254,255.255.255.255,ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128,ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe,ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        )
+        .unwrap();
+        assert_eq!(maximum.ipv4, vec![(u32::MAX - 1, u32::MAX)]);
+        assert_eq!(maximum.ipv6, vec![(u128::MAX - 1, u128::MAX)]);
+    }
+
+    #[test]
+    fn whitelist_preserves_empty_and_address_family_semantics() {
+        let addresses = [
+            "0.0.0.0",
+            "192.0.2.1",
+            "255.255.255.255",
+            "::",
+            "::ffff:192.0.2.1",
+            "2001:db8::1",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ]
+        .map(|address| address.parse().unwrap());
+        for value in [
+            "",
+            "   ",
+            "0.0.0.0/0",
+            "::/0",
+            "::ffff:192.0.2.1/80",
+            "::ffff:192.0.2.1/96",
+            "::ffff:192.0.2.1/128",
+        ] {
+            assert_whitelist_matches_linear(value, addresses);
+        }
+        assert!(Whitelist::default().allows("203.0.113.1".parse().unwrap()));
+        assert!(Whitelist::parse(" \t ").unwrap().is_empty());
+        assert!(!Whitelist::parse("0.0.0.0/0").unwrap().is_empty());
+        assert!(
+            !Whitelist::parse("::/0")
+                .unwrap()
+                .allows("192.0.2.1".parse().unwrap())
+        );
+        assert!(
+            Whitelist::parse("::/0")
+                .unwrap()
+                .allows("::ffff:192.0.2.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn whitelist_all_prefix_lengths_match_linear_boundaries() {
+        let ipv4 = u32::from("192.0.2.129".parse::<Ipv4Addr>().unwrap());
+        for bits in 0..=32 {
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            let start = ipv4 & mask;
+            let end = start | !mask;
+            let addresses = [start, end, start.wrapping_sub(1), end.wrapping_add(1)]
+                .into_iter()
+                .flat_map(|address| {
+                    let address = Ipv4Addr::from(address);
+                    [IpAddr::V4(address), IpAddr::V6(address.to_ipv6_mapped())]
+                });
+            assert_whitelist_matches_linear(&format!("192.0.2.129/{bits}"), addresses);
+        }
+        for source in [
+            "2001:db8:1234:5678:9abc:def0:1234:5678",
+            "::ffff:192.0.2.129",
+        ] {
+            let ipv6 = u128::from(source.parse::<Ipv6Addr>().unwrap());
+            for bits in 0..=128 {
+                let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+                let start = ipv6 & mask;
+                let end = start | !mask;
+                let mut addresses = vec![
+                    IpAddr::V6(Ipv6Addr::from(start)),
+                    IpAddr::V6(Ipv6Addr::from(end)),
+                    IpAddr::V6(Ipv6Addr::from(start.wrapping_sub(1))),
+                    IpAddr::V6(Ipv6Addr::from(end.wrapping_add(1))),
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 129)),
+                ];
+                addresses.push(source.parse().unwrap());
+                assert_whitelist_matches_linear(&format!("{source}/{bits}"), addresses);
+            }
+        }
+    }
+
+    #[test]
+    fn large_mixed_whitelist_matches_deterministic_linear_reference() {
+        let mut entries = vec![
+            "::ffff:192.0.2.0/120".to_owned(),
+            "198.51.100.20".to_owned(),
+        ];
+        let mut addresses = Vec::new();
+        for index in 0..512 {
+            entries.push(format!("10.{}.{}.129/25", index / 256, index % 256));
+            entries.push(format!("2001:db8:{index:x}::3/126"));
+            addresses.push(
+                format!("10.{}.{}.255", index / 256, index % 256)
+                    .parse()
+                    .unwrap(),
+            );
+            addresses.push(format!("2001:db8:{index:x}::3").parse().unwrap());
+        }
+        let mut state = 0x6a09_e667_f3bc_c908_u128;
+        for _ in 0..1024 {
+            state = state
+                .wrapping_mul(0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645)
+                .wrapping_add(1);
+            let ipv4 = Ipv4Addr::from(state as u32);
+            addresses.extend([
+                IpAddr::V4(ipv4),
+                IpAddr::V6(ipv4.to_ipv6_mapped()),
+                IpAddr::V6(Ipv6Addr::from(state)),
+            ]);
+        }
+        assert_whitelist_matches_linear(&entries.join(","), addresses);
     }
 
     #[test]

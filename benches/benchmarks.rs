@@ -47,15 +47,6 @@ fn protocol_benchmarks() {
         &payload,
     )
     .unwrap();
-    let whitelist = Whitelist::parse("198.51.100.10,192.0.2.0/24,2001:db8::/32").unwrap();
-    let large_entries = (0..256)
-        .map(|index| format!("10.{index}.0.0/16"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let large_whitelist = Whitelist::parse(&large_entries).unwrap();
-    let matching: IpAddr = "192.0.2.20".parse().unwrap();
-    let missing: IpAddr = "203.0.113.20".parse().unwrap();
-
     measure("UDP IPv4 解析 1024 字节", 500_000, 1, || {
         black_box(protocol::parse_datagram(black_box(&ipv4_packet)).unwrap());
     });
@@ -68,6 +59,24 @@ fn protocol_benchmarks() {
             black_box(&payload),
         ));
     });
+}
+
+fn whitelist_benchmarks() {
+    let whitelist = Whitelist::parse("198.51.100.10,192.0.2.0/24,2001:db8::/32").unwrap();
+    let large_entries = (0..256)
+        .map(|index| format!("10.{index}.0.0/16"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let large_whitelist = Whitelist::parse(&large_entries).unwrap();
+    let sparse_entries = (0..4096)
+        .map(|index| format!("10.{}.{}.0/24", index / 128, index % 128 * 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sparse_whitelist = Whitelist::parse(&sparse_entries).unwrap();
+    let matching: IpAddr = "192.0.2.20".parse().unwrap();
+    let missing: IpAddr = "203.0.113.20".parse().unwrap();
+    let sparse_matching: IpAddr = "10.31.254.20".parse().unwrap();
+
     measure("白名单命中", 1_000_000, 1, || {
         black_box(whitelist.allows(black_box(matching)));
     });
@@ -76,6 +85,17 @@ fn protocol_benchmarks() {
     });
     measure("256 个网段白名单未命中", 200_000, 1, || {
         black_box(large_whitelist.allows(black_box(missing)));
+    });
+    measure(
+        "4096 个离散网段白名单末尾命中",
+        20_000,
+        1,
+        || {
+            black_box(sparse_whitelist.allows(black_box(sparse_matching)));
+        },
+    );
+    measure("4096 个离散网段白名单未命中", 20_000, 1, || {
+        black_box(sparse_whitelist.allows(black_box(missing)));
     });
 }
 
@@ -244,7 +264,35 @@ fn tcp_benchmarks() {
 }
 
 fn main() {
-    protocol_benchmarks();
-    udp_roundtrip_benchmark();
-    tcp_benchmarks();
+    let groups = std::env::args()
+        .skip(1)
+        .filter(|argument| argument != "--bench")
+        .collect::<Vec<_>>();
+    if groups.iter().any(|group| {
+        !matches!(
+            group.as_str(),
+            "all" | "protocol" | "whitelist" | "udp" | "tcp"
+        )
+    }) {
+        eprintln!("基准分组必须是 all、protocol、whitelist、udp 或 tcp，可指定多个分组");
+        std::process::exit(2);
+    }
+    let selected = |group: &str| {
+        groups.is_empty()
+            || groups
+                .iter()
+                .any(|argument| argument == "all" || argument == group)
+    };
+    if selected("protocol") {
+        protocol_benchmarks();
+    }
+    if selected("whitelist") {
+        whitelist_benchmarks();
+    }
+    if selected("udp") {
+        udp_roundtrip_benchmark();
+    }
+    if selected("tcp") {
+        tcp_benchmarks();
+    }
 }
