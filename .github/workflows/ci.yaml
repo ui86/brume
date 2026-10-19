@@ -24,5 +24,26 @@ jobs:
         run: |
           bash -n install.sh
           for test_script in tests/*.bash; do
+            case "$test_script" in tests/linux_*) continue ;; esac
             bash "$test_script"
           done
+  linux-integration:
+    name: Linux resource and firewall integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+      - name: Install isolated firewall test tools
+        run: sudo apt-get update && sudo apt-get install -y nftables iptables iproute2
+      - run: cargo build --locked
+      - name: Verify descriptor exhaustion and recovery
+        run: python3 tests/linux_resources.py target/debug/brume
+      - name: Verify firewall rules in an isolated network namespace
+        run: sudo unshare --net bash tests/linux_firewall.bash
+      - name: Verify temporary systemd service and transaction recovery
+        run: |
+          sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            BRUME_CI_SYSTEMD=1 bash tests/linux_systemd.bash "$PWD/target/debug/brume"

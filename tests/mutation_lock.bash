@@ -45,7 +45,8 @@ EOF
         exit 1
     fi
     # 服务管理命令及其启动的常驻进程不能看到锁描述符
-    execute_privileged bash -c 'if { : <&"$1"; } 2>/dev/null; then exit 1; fi' -- "${mutation_lock_fd}"
+    # 直接检查描述符，避免重定向时 Bash 临时借用被关闭的编号。
+    execute_privileged bash -c '[[ ! -L /proc/self/fd/$1 ]]' -- "${mutation_lock_fd}"
     execute_privileged bash -c 'bash "$1/daemon.sh" "$1" </dev/null >/dev/null 2>&1 & echo "$!" > "$1/daemon.pid"' -- "${test_dir}"
 )
 kill -0 "$(cat "${test_dir}/daemon.pid")"
