@@ -1,7 +1,9 @@
 use crate::happy_eyeballs::happy_eyeballs_connect;
 use crate::protocol::{self, Host, Target};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::future::Future;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
@@ -54,6 +56,74 @@ fn connect_proxy(server: String) -> io::Result<TcpStream> {
     };
     stream.set_nonblocking(false)?;
     Ok(stream)
+}
+
+fn resolve_udp_relay_with_timeout<F>(
+    lookup: F,
+    preferred_ipv4: bool,
+    timeout: Duration,
+) -> io::Result<SocketAddr>
+where
+    F: Future<Output = io::Result<Vec<SocketAddr>>> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let task = connector_runtime()?.spawn(async move {
+        let result = tokio::time::timeout(timeout, lookup)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "解析 UDP 中转地址超时"))
+            .and_then(|result| result)
+            .and_then(|mut addresses| {
+                for address in &mut addresses {
+                    *address = normalize_udp_relay(*address);
+                }
+                addresses
+                    .iter()
+                    .find(|address| address.is_ipv4() == preferred_ipv4)
+                    .or_else(|| addresses.first())
+                    .copied()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "UDP 中转地址没有解析结果")
+                    })
+            });
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            task.abort();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "解析 UDP 中转地址超时",
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("UDP 中转地址解析任务意外退出"))
+        }
+    }
+}
+
+fn normalize_udp_relay(address: SocketAddr) -> SocketAddr {
+    match address.ip() {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(|ipv4| SocketAddr::new(IpAddr::V4(ipv4), address.port()))
+            .unwrap_or(address),
+        IpAddr::V4(_) => address,
+    }
+}
+
+fn bind_udp_socket(address: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    if address.is_ipv6() {
+        // 分别保留两种协议族的端口，切换中继地址时无需更改已声明的端口
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&address.into())?;
+    Ok(socket.into())
 }
 
 pub struct Client {
@@ -155,7 +225,7 @@ impl Client {
         let mut control = self.negotiate()?;
         let peer = control.peer_addr()?;
         let bind = unspecified(control.local_addr()?.ip());
-        let socket = UdpSocket::bind(bind)?;
+        let mut socket = bind_udp_socket(bind)?;
         let request = Target {
             host: Host::Ip(bind.ip()),
             port: socket.local_addr()?.port(),
@@ -163,20 +233,30 @@ impl Client {
         protocol::write_request(&mut control, protocol::UDP_ASSOCIATE, &request)?;
         let (status, reply) = protocol::read_reply(&mut control)?;
         check_status(status)?;
-        let relay_ip = match reply.host {
-            Host::Ip(ip) if !ip.is_unspecified() => ip,
-            Host::Ip(_) => peer.ip(),
-            Host::Domain(name) => {
-                let address = (name.as_str(), reply.port)
-                    .to_socket_addrs()?
-                    .find(|address| address.is_ipv4() == bind.is_ipv4())
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "UDP 中转地址没有匹配的协议族")
-                    })?;
-                address.ip()
-            }
-        };
-        let relay = SocketAddr::new(relay_ip, reply.port);
+        let relay = normalize_udp_relay(match reply.host {
+            Host::Ip(ip) if !ip.is_unspecified() => SocketAddr::new(ip, reply.port),
+            Host::Ip(_) => SocketAddr::new(peer.ip(), reply.port),
+            Host::Domain(name) => resolve_udp_relay_with_timeout(
+                async move {
+                    Ok(tokio::net::lookup_host((name.as_str(), reply.port))
+                        .await?
+                        .collect())
+                },
+                bind.is_ipv4(),
+                CONNECT_TIMEOUT,
+            )?,
+        });
+        if relay.is_ipv4() != bind.is_ipv4() {
+            let mut relay_bind = unspecified(relay.ip());
+            relay_bind.set_port(request.port);
+            // 新协议族绑定成功前保留原套接字，端口冲突时明确失败
+            socket = bind_udp_socket(relay_bind).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("无法为 UDP 中继保留已声明端口 {}：{error}", request.port),
+                )
+            })?;
+        }
         socket.connect(relay)?;
         socket.set_read_timeout(self.udp_timeout)?;
         socket.set_write_timeout(self.udp_timeout)?;
@@ -363,5 +443,208 @@ mod tests {
             server.join().unwrap(),
             association.local_addr().unwrap().port()
         );
+    }
+
+    fn assert_udp_relay_works(control_bind: &str, relay_bind: &str, domain_reply: bool) {
+        let listener = TcpListener::bind(control_bind).unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let relay = UdpSocket::bind(relay_bind).unwrap();
+        relay
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let relay_address = relay.local_addr().unwrap();
+        let destination: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+            let (command, request) = protocol::read_request(&mut stream).unwrap();
+            assert_eq!(command, protocol::UDP_ASSOCIATE);
+            assert_ne!(request.port, 0);
+            if domain_reply {
+                let name = b"localhost";
+                let mut reply = vec![5, protocol::SUCCESS, 0, 3, name.len() as u8];
+                reply.extend_from_slice(name);
+                reply.extend_from_slice(&relay_address.port().to_be_bytes());
+                stream.write_all(&reply).unwrap();
+            } else {
+                protocol::write_reply(&mut stream, protocol::SUCCESS, relay_address).unwrap();
+            }
+            let mut packet = [0; 100];
+            let (length, source) = relay.recv_from(&mut packet).unwrap();
+            assert_eq!(source.port(), request.port);
+            assert_eq!(
+                protocol::parse_datagram(&packet[..length]).unwrap(),
+                (Target::from(destination), b"hello".as_slice())
+            );
+            relay
+                .send_to(&protocol::encode_datagram(destination, b"world"), source)
+                .unwrap();
+            request.port
+        });
+        let mut client = Client::new(proxy.to_string(), "", "").unwrap();
+        client.set_udp_timeout(Some(Duration::from_secs(3)));
+        let association = client.associate(Target::from(destination)).unwrap();
+        assert_eq!(association.relay_addr(), relay_address);
+        assert_eq!(
+            association.local_addr().unwrap().is_ipv4(),
+            relay_address.is_ipv4()
+        );
+        association.send(b"hello").unwrap();
+        let mut payload = [0; 100];
+        let (length, source) = association.recv(&mut payload).unwrap();
+        assert_eq!(&payload[..length], b"world");
+        assert_eq!(source, Target::from(destination));
+        assert_eq!(
+            association.local_addr().unwrap().port(),
+            server.join().unwrap()
+        );
+    }
+
+    #[test]
+    fn udp_associate_supports_ipv4_control_and_ipv6_relay() {
+        assert_udp_relay_works("127.0.0.1:0", "[::1]:0", false);
+    }
+
+    #[test]
+    fn udp_associate_supports_ipv6_control_and_ipv4_relay() {
+        assert_udp_relay_works("[::1]:0", "127.0.0.1:0", false);
+    }
+
+    #[test]
+    fn udp_associate_resolves_relay_domain() {
+        assert_udp_relay_works("127.0.0.1:0", "127.0.0.1:0", true);
+    }
+
+    #[test]
+    fn udp_relay_resolution_prefers_control_family_and_allows_fallback() {
+        let ipv4: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let ipv6: SocketAddr = "[::1]:1080".parse().unwrap();
+        for preferred_ipv4 in [true, false] {
+            let selected = resolve_udp_relay_with_timeout(
+                async move { Ok(vec![ipv6, ipv4]) },
+                preferred_ipv4,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(selected, if preferred_ipv4 { ipv4 } else { ipv6 });
+            let fallback = if preferred_ipv4 { ipv6 } else { ipv4 };
+            assert_eq!(
+                resolve_udp_relay_with_timeout(
+                    async move { Ok(vec![fallback]) },
+                    preferred_ipv4,
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+                fallback
+            );
+        }
+    }
+
+    #[test]
+    fn udp_relay_normalizes_ipv4_mapped_addresses() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:1080".parse().unwrap();
+        let ipv4: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        assert_eq!(normalize_udp_relay(mapped), ipv4);
+        let selected = resolve_udp_relay_with_timeout(
+            async move { Ok(vec![mapped]) },
+            true,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(selected, ipv4);
+    }
+
+    #[test]
+    fn udp_relay_resolution_times_out_and_cancels_lookup() {
+        struct NotifyDrop(mpsc::SyncSender<()>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let (cancelled, cancellation) = mpsc::sync_channel(1);
+        let guard = NotifyDrop(cancelled);
+        let started = std::time::Instant::now();
+        let error = resolve_udp_relay_with_timeout(
+            async move {
+                let _guard = guard;
+                std::future::pending().await
+            },
+            true,
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        cancellation.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn udp_relay_resolution_rejects_empty_answers_and_preserves_lookup_errors() {
+        let empty =
+            resolve_udp_relay_with_timeout(async { Ok(Vec::new()) }, true, Duration::from_secs(1))
+                .unwrap_err();
+        assert_eq!(empty.kind(), io::ErrorKind::NotFound);
+        let refused = resolve_udp_relay_with_timeout(
+            async {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "DNS 查询被拒绝",
+                ))
+            },
+            true,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn udp_relay_family_switch_rejects_conflicting_declared_ports() {
+        for (control_bind, relay_ip) in [
+            ("127.0.0.1:0", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ("[::1]:0", IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ] {
+            let listener = TcpListener::bind(control_bind).unwrap();
+            let proxy = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).unwrap();
+                stream.write_all(&[5, 0]).unwrap();
+                let (_, request) = protocol::read_request(&mut stream).unwrap();
+                let mut blocked_address = unspecified(relay_ip);
+                blocked_address.set_port(request.port);
+                let _blocked = bind_udp_socket(blocked_address).unwrap();
+                protocol::write_reply(
+                    &mut stream,
+                    protocol::SUCCESS,
+                    SocketAddr::new(relay_ip, 53),
+                )
+                .unwrap();
+                let mut closed = [0];
+                assert_eq!(stream.read(&mut closed).unwrap(), 0);
+                request.port
+            });
+            let client = Client::new(proxy.to_string(), "", "").unwrap();
+            let error = client
+                .associate(Target::from("127.0.0.1:53".parse::<SocketAddr>().unwrap()))
+                .err()
+                .expect("目标协议族端口被占用时应拒绝关联");
+            let declared_port = server.join().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("已声明端口 {declared_port}"))
+            );
+        }
     }
 }
