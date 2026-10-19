@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::dns::DnsResolver;
+use crate::dns::{DnsResolver, PendingLookup};
 use crate::protocol::{self, Host, Target};
 use hickory_resolver::net::NetError;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -22,6 +22,10 @@ const MAX_UDP_PACKET_TASKS: usize = 256;
 const MAX_UDP_FLOWS: usize = 1024;
 const MAX_FLOWS_PER_ASSOCIATION: usize = 128;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const UDP_DNS_FALLBACK_GRACE: Duration = Duration::from_millis(50);
+const INITIAL_TCP_BUFFER_SIZE: usize = 8192;
+const MAX_TCP_BUFFER_SIZE: usize = 65536;
+static NEXT_UDP_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
 type Associations = Arc<Mutex<AssociationRegistry>>;
 
@@ -70,7 +74,13 @@ struct Association {
     alive: AtomicBool,
     stopped: CancellationToken,
     flows: Mutex<HashMap<Target, Arc<FlowSlot>>>,
-    preferred_addresses: Mutex<HashMap<Target, usize>>,
+    preferred_addresses: Mutex<HashMap<Target, UdpPreference>>,
+}
+
+#[derive(Clone, Copy)]
+struct UdpPreference {
+    address: SocketAddr,
+    flow_id: u64,
 }
 
 impl Association {
@@ -102,10 +112,12 @@ struct Flow {
     active: AtomicBool,
     stopped: CancellationToken,
     address_index: usize,
-    address_count: usize,
+    addresses: Mutex<Vec<SocketAddr>>,
+    pending_lookup: Mutex<Option<PendingLookup>>,
 }
 
 struct FlowSlot {
+    id: u64,
     flow: OnceCell<Option<Arc<Flow>>>,
     _permit: OwnedSemaphorePermit,
 }
@@ -129,7 +141,12 @@ fn endpoint_key(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(normalize(address.ip()), address.port())
 }
 
-fn remember_udp_address(association: &Association, target: &Target, index: usize) {
+fn remember_udp_address(
+    association: &Association,
+    target: &Target,
+    address: SocketAddr,
+    flow_id: u64,
+) {
     let mut preferred = association.preferred_addresses.lock().unwrap();
     if preferred.len() >= MAX_FLOWS_PER_ASSOCIATION
         && !preferred.contains_key(target)
@@ -137,16 +154,27 @@ fn remember_udp_address(association: &Association, target: &Target, index: usize
     {
         preferred.remove(&oldest);
     }
-    preferred.insert(target.clone(), index);
+    preferred.insert(target.clone(), UdpPreference { address, flow_id });
 }
 
-fn advance_udp_address(association: &Association, target: &Target, flow: &Flow) {
-    if flow.address_count > 1 {
-        remember_udp_address(
-            association,
-            target,
-            (flow.address_index + 1) % flow.address_count,
-        );
+fn advance_udp_address(association: &Association, target: &Target, flow: &Flow, slot: &FlowSlot) {
+    let addresses = flow.addresses.lock().unwrap();
+    if addresses.len() > 1 {
+        let mut preferred = association.preferred_addresses.lock().unwrap();
+        // 晚到的旧流结果不能覆盖后续新流已经选择的地址。
+        if let Some(current) = preferred.get_mut(target)
+            && current.flow_id == slot.id
+        {
+            current.address = addresses[(flow.address_index + 1) % addresses.len()];
+        }
+    }
+}
+
+fn append_udp_addresses(addresses: &mut Vec<SocketAddr>, more: Vec<SocketAddr>) {
+    for address in more {
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
     }
 }
 
@@ -489,15 +517,21 @@ async fn forward_bidirectional(
     timeout: Option<Duration>,
 ) -> io::Result<()> {
     match timeout {
-        None => tokio::io::copy_bidirectional_with_sizes(client, remote, 65536, 65536)
-            .await
-            .map(|_| ()),
+        None => {
+            let (mut client_r, mut client_w) = client.split();
+            let (mut remote_r, mut remote_w) = remote.split();
+            tokio::try_join!(
+                copy_direction(&mut client_r, &mut remote_w, None),
+                copy_direction(&mut remote_r, &mut client_w, None),
+            )
+            .map(|_| ())
+        }
         Some(idle_timeout) => {
             let (mut client_r, mut client_w) = client.split();
             let (mut remote_r, mut remote_w) = remote.split();
             let (activity, mut activity_rx) = watch::channel(tokio::time::Instant::now());
-            let c2r = copy_direction(&mut client_r, &mut remote_w, &activity);
-            let r2c = copy_direction(&mut remote_r, &mut client_w, &activity);
+            let c2r = copy_direction(&mut client_r, &mut remote_w, Some(&activity));
+            let r2c = copy_direction(&mut remote_r, &mut client_w, Some(&activity));
             let transfer = async { tokio::try_join!(c2r, r2c).map(|_| ()) };
             tokio::pin!(transfer);
 
@@ -529,13 +563,14 @@ async fn forward_bidirectional(
 async fn copy_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
-    activity: &watch::Sender<tokio::time::Instant>,
+    activity: Option<&watch::Sender<tokio::time::Instant>>,
 ) -> io::Result<u64>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let mut buffer = vec![0u8; 65536];
+    // 小流量连接保持较小缓冲，连续满读时按需增长到批量转发所需的大小。
+    let mut buffer = vec![0u8; INITIAL_TCP_BUFFER_SIZE];
     let mut total = 0u64;
     loop {
         let n = reader.read(&mut buffer).await?;
@@ -544,8 +579,13 @@ where
             break;
         }
         writer.write_all(&buffer[..n]).await?;
-        activity.send_replace(tokio::time::Instant::now());
+        if let Some(activity) = activity {
+            activity.send_replace(tokio::time::Instant::now());
+        }
         total += n as u64;
+        if n == buffer.len() && buffer.len() < MAX_TCP_BUFFER_SIZE {
+            buffer.resize((buffer.len() * 2).min(MAX_TCP_BUFFER_SIZE), 0);
+        }
     }
     Ok(total)
 }
@@ -751,6 +791,7 @@ async fn handle_udp_packet(
                     return;
                 };
                 let slot = Arc::new(FlowSlot {
+                    id: NEXT_UDP_FLOW_ID.fetch_add(1, Ordering::Relaxed),
                     flow: OnceCell::new(),
                     _permit: permit,
                 });
@@ -761,44 +802,66 @@ async fn handle_udp_packet(
         let flow = slot
             .flow
             .get_or_init(|| async {
-                let addresses = dns.lookup(&target).await.ok()?;
-                let start = association
+                let mut lookup = dns.lookup_udp(&target).await.ok()?;
+                let preferred = association
                     .preferred_addresses
                     .lock()
                     .unwrap()
                     .get(&target)
-                    .copied()
-                    .unwrap_or(0)
-                    % addresses.len();
-                let mut selected = None;
-                for offset in 0..addresses.len() {
-                    let index = (start + offset) % addresses.len();
-                    let destination = addresses[index];
-                    let Ok(std_socket) = std::net::UdpSocket::bind(unspecified(destination.ip()))
-                    else {
-                        continue;
-                    };
-                    if std_socket.connect(destination).is_err()
-                        || std_socket.set_nonblocking(true).is_err()
-                    {
-                        continue;
+                    .map(|preference| preference.address);
+                // 已知备用地址属于另一族时，给予短暂解析机会，避免反复选中失效地址。
+                if preferred.is_some_and(|address| !lookup.addresses.contains(&address))
+                    && let Some(pending) = lookup.pending.as_mut()
+                    && let Ok(result) = tokio::time::timeout(UDP_DNS_FALLBACK_GRACE, pending).await
+                {
+                    lookup.pending = None;
+                    if let Ok(more) = result {
+                        append_udp_addresses(&mut lookup.addresses, more);
                     }
-                    if let Ok(socket) = tokio::net::UdpSocket::from_std(std_socket) {
-                        selected = Some((destination, index, socket));
+                }
+                let mut addresses = lookup.addresses;
+                let mut selected = None;
+                loop {
+                    let start = preferred
+                        .and_then(|address| {
+                            addresses.iter().position(|candidate| *candidate == address)
+                        })
+                        .unwrap_or(0);
+                    for offset in 0..addresses.len() {
+                        let index = (start + offset) % addresses.len();
+                        let destination = addresses[index];
+                        let Ok(std_socket) =
+                            std::net::UdpSocket::bind(unspecified(destination.ip()))
+                        else {
+                            continue;
+                        };
+                        if std_socket.connect(destination).is_err()
+                            || std_socket.set_nonblocking(true).is_err()
+                        {
+                            continue;
+                        }
+                        if let Ok(socket) = tokio::net::UdpSocket::from_std(std_socket) {
+                            selected = Some((destination, index, socket));
+                            break;
+                        }
+                    }
+                    if selected.is_some() {
                         break;
                     }
+                    // 首族套接字无法建立时仍保留晚到的另一族回退。
+                    let more = lookup.pending.take()?.await.ok()?;
+                    append_udp_addresses(&mut addresses, more);
                 }
                 let (destination, address_index, socket) = selected?;
-                if addresses.len() > 1 {
-                    remember_udp_address(association, &target, address_index);
-                }
+                remember_udp_address(association, &target, destination, slot.id);
                 let flow = Arc::new(Flow {
                     socket: Arc::new(socket),
                     last_activity: Mutex::new(Instant::now()),
                     active: AtomicBool::new(true),
                     stopped: CancellationToken::new(),
                     address_index,
-                    address_count: addresses.len(),
+                    addresses: Mutex::new(addresses),
+                    pending_lookup: Mutex::new(lookup.pending),
                 });
                 let worker = Arc::clone(&flow);
                 let association = Arc::clone(association);
@@ -843,11 +906,11 @@ async fn handle_udp_packet(
             return;
         }
         if flow.active.swap(false, Ordering::Relaxed) {
-            advance_udp_address(association, &target, flow);
+            advance_udp_address(association, &target, flow, &slot);
         }
         flow.stopped.cancel();
         remove_flow_slot(association, &target, &slot);
-        if attempts >= flow.address_count {
+        if attempts >= flow.addresses.lock().unwrap().len() {
             return;
         }
     }
@@ -872,7 +935,9 @@ async fn receive_remote(
     destination: SocketAddr,
     timeout: Duration,
 ) {
-    let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
+    // 无回复的 UDP 流不预分配最大报文缓冲，收到就绪通知后再申请。
+    let mut buffer = Vec::new();
+    let mut pending_lookup = flow.pending_lookup.lock().unwrap().take();
     let mut received_reply = false;
     let mut failed = false;
     while association.alive.load(Ordering::Relaxed) {
@@ -894,13 +959,27 @@ async fn receive_remote(
                 _ = association.stopped.cancelled() => break,
                 _ = flow.stopped.cancelled() => break,
                 _ = tokio::time::sleep_until(deadline) => continue,
-                result = flow.socket.recv(&mut buffer[22..]) => result,
+                result = async { pending_lookup.as_mut().unwrap().await }, if pending_lookup.is_some() => {
+                    if let Ok(more) = result {
+                        append_udp_addresses(&mut flow.addresses.lock().unwrap(), more);
+                    }
+                    pending_lookup = None;
+                    continue;
+                }
+                result = receive_udp_payload(&flow.socket, &mut buffer) => result,
             }
         } else {
             tokio::select! {
                 _ = association.stopped.cancelled() => break,
                 _ = flow.stopped.cancelled() => break,
-                result = flow.socket.recv(&mut buffer[22..]) => result,
+                result = async { pending_lookup.as_mut().unwrap().await }, if pending_lookup.is_some() => {
+                    if let Ok(more) = result {
+                        append_udp_addresses(&mut flow.addresses.lock().unwrap(), more);
+                    }
+                    pending_lookup = None;
+                    continue;
+                }
+                result = receive_udp_payload(&flow.socket, &mut buffer) => result,
             }
         };
 
@@ -930,10 +1009,44 @@ async fn receive_remote(
         }
     }
 
-    if flow.active.swap(false, Ordering::Relaxed) && failed {
-        advance_udp_address(&association, &target, &flow);
+    let was_active = flow.active.swap(false, Ordering::Relaxed);
+    failed |= flow.stopped.is_cancelled() && !received_reply;
+    if failed && association.alive.load(Ordering::Relaxed) {
+        // 流先停止转发，再在 DNS 总预算内补全备用地址；保留 slot 许可限制等待任务数量。
+        if let Some(pending) = pending_lookup.take() {
+            tokio::select! {
+                _ = association.stopped.cancelled() => {}
+                result = pending => {
+                    if let Ok(more) = result {
+                        append_udp_addresses(&mut flow.addresses.lock().unwrap(), more);
+                    }
+                }
+            }
+        }
+    }
+    if (was_active || flow.stopped.is_cancelled())
+        && failed
+        && association.alive.load(Ordering::Relaxed)
+    {
+        advance_udp_address(&association, &target, &flow, &slot);
     }
     remove_flow_slot(&association, &target, &slot);
+}
+
+async fn receive_udp_payload(
+    socket: &tokio::net::UdpSocket,
+    buffer: &mut Vec<u8>,
+) -> io::Result<usize> {
+    loop {
+        socket.readable().await?;
+        if buffer.is_empty() {
+            buffer.resize(UDP_BUFFER_SIZE, 0);
+        }
+        match socket.try_recv(&mut buffer[22..]) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            result => return result,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1033,6 +1146,262 @@ mod tests {
             tcp_timeout: None,
             udp_timeout: Duration::ZERO,
             dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
+        }
+    }
+
+    async fn udp_domain_association(
+        config: Config,
+    ) -> (
+        tokio::net::TcpStream,
+        tokio::net::UdpSocket,
+        SocketAddr,
+        CancellationToken,
+        tokio::task::JoinHandle<io::Result<()>>,
+        Associations,
+    ) {
+        let shutdown = CancellationToken::new();
+        let server = Server::bind(config, shutdown.clone()).unwrap();
+        let proxy = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            server.local_addr().unwrap().port(),
+        );
+        let associations = Arc::clone(&server.associations);
+        let task = tokio::spawn(server.run_async());
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut control = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        control.write_all(&[5, 1, 0]).await.unwrap();
+        let mut reply = [0; 2];
+        control.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 0]);
+        protocol::write_request_async(
+            &mut control,
+            protocol::UDP_ASSOCIATE,
+            &Target::from(socket.local_addr().unwrap()),
+        )
+        .await
+        .unwrap();
+        let (status, relay) = protocol::read_reply_async(&mut control).await.unwrap();
+        assert_eq!(status, protocol::SUCCESS);
+        let Host::Ip(ip) = relay.host else {
+            panic!("中继必须返回 IP 地址")
+        };
+        (
+            control,
+            socket,
+            SocketAddr::new(ip, relay.port),
+            shutdown,
+            task,
+            associations,
+        )
+    }
+
+    #[tokio::test]
+    async fn udp_domain_first_packet_uses_available_family_without_waiting() {
+        use crate::dns::tests::{DnsReply, scripted_dns};
+        for ipv6 in [false, true] {
+            let reply = DnsReply::Answer(Duration::ZERO);
+            let dns = if ipv6 {
+                scripted_dns(DnsReply::Drop, reply, 60).await
+            } else {
+                scripted_dns(reply, DnsReply::Drop, 60).await
+            };
+            let remote = tokio::net::UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.42:0" })
+                .await
+                .unwrap();
+            let mut config = test_config();
+            config.dns_servers = vec![dns.address];
+            let (_control, client, relay, shutdown, task, _) = udp_domain_association(config).await;
+            let target = Target {
+                host: Host::Domain("udp-fast.example.".into()),
+                port: remote.local_addr().unwrap().port(),
+            };
+            let packet = protocol::encode_datagram_to(&target, b"first").unwrap();
+            client.send_to(&packet, relay).await.unwrap();
+            let mut buffer = [0; 64];
+            let (length, source) =
+                tokio::time::timeout(Duration::from_millis(700), remote.recv_from(&mut buffer))
+                    .await
+                    .expect("UDP 首包被无响应的另一地址族阻塞")
+                    .unwrap();
+            assert_eq!(&buffer[..length], b"first");
+            remote.send_to(&buffer[..length], source).await.unwrap();
+            let (length, _) =
+                tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                protocol::parse_datagram(&buffer[..length]).unwrap().1,
+                b"first"
+            );
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("取消服务必须同时停止未完成的 DNS 查询")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_domain_keeps_delayed_family_for_next_flow() {
+        use crate::dns::tests::{DnsReply, scripted_dns};
+        for ipv6 in [false, true] {
+            let delayed = DnsReply::Answer(Duration::from_millis(400));
+            let first = DnsReply::Answer(Duration::ZERO);
+            let dns = if ipv6 {
+                scripted_dns(first, delayed, 60).await
+            } else {
+                scripted_dns(delayed, first, 60).await
+            };
+            let remote = tokio::net::UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.42:0" })
+                .await
+                .unwrap();
+            let destination = remote.local_addr().unwrap();
+            let mut config = test_config();
+            config.dns_servers = vec![dns.address];
+            config.udp_timeout = Duration::from_millis(250);
+            let (_control, client, relay, shutdown, task, associations) =
+                udp_domain_association(config).await;
+            let target = Target {
+                host: Host::Domain("udp-fallback.example.".into()),
+                port: destination.port(),
+            };
+            let packet = protocol::encode_datagram_to(&target, b"fallback").unwrap();
+            client.send_to(&packet, relay).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let ready = {
+                        let registry = associations.lock().unwrap();
+                        registry.entries.values().any(|association| {
+                            association
+                                .preferred_addresses
+                                .lock()
+                                .unwrap()
+                                .get(&target)
+                                .map(|preference| preference.address)
+                                == Some(destination)
+                        })
+                    };
+                    if ready {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("晚到地址未被保留为备用目标");
+            client.send_to(&packet, relay).await.unwrap();
+            let mut buffer = [0; 64];
+            let (length, _) =
+                tokio::time::timeout(Duration::from_millis(700), remote.recv_from(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&buffer[..length], b"fallback");
+            shutdown.cancel();
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_reply_buffer_is_lazy_and_keeps_large_datagrams() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buffer = Vec::new();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                receive_udp_payload(&receiver, &mut buffer)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(buffer.capacity(), 0);
+        let payload = vec![42; 60_000];
+        sender
+            .send_to(&payload, receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        let length = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_udp_payload(&receiver, &mut buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(length, payload.len());
+        assert_eq!(&buffer[22..22 + length], payload);
+    }
+
+    #[tokio::test]
+    async fn old_udp_worker_cannot_replace_new_flow_preference_or_exceed_limit() {
+        let (association, flow, _, target, destination) = test_udp_flow().await;
+        let old_slot = Arc::clone(association.flows.lock().unwrap().get(&target).unwrap());
+        let new_id = NEXT_UDP_FLOW_ID.fetch_add(1, Ordering::Relaxed);
+        remember_udp_address(&association, &target, destination, new_id);
+        advance_udp_address(&association, &target, &flow, &old_slot);
+        assert_eq!(
+            association.preferred_addresses.lock().unwrap()[&target].address,
+            destination
+        );
+        association.preferred_addresses.lock().unwrap().clear();
+        for port in 1..=MAX_FLOWS_PER_ASSOCIATION {
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port as u16);
+            remember_udp_address(&association, &Target::from(address), address, new_id);
+        }
+        advance_udp_address(&association, &target, &flow, &old_slot);
+        let preferred = association.preferred_addresses.lock().unwrap();
+        assert_eq!(preferred.len(), MAX_FLOWS_PER_ASSOCIATION);
+        assert!(!preferred.contains_key(&target));
+    }
+
+    #[tokio::test]
+    async fn tcp_buffers_grow_for_bulk_reads_and_stay_small_for_short_messages() {
+        struct ProbeReader {
+            remaining: usize,
+            sizes: Vec<usize>,
+        }
+        impl tokio::io::AsyncRead for ProbeReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                self.sizes.push(buffer.remaining());
+                let length = self.remaining.min(buffer.remaining());
+                buffer.put_slice(&vec![42; length]);
+                self.remaining -= length;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        for length in [1024, 256 * 1024] {
+            let mut reader = ProbeReader {
+                remaining: length,
+                sizes: Vec::new(),
+            };
+            let mut output = Vec::new();
+            assert_eq!(
+                copy_direction(&mut reader, &mut output, None)
+                    .await
+                    .unwrap(),
+                length as u64
+            );
+            assert_eq!(output, vec![42; length]);
+            assert_eq!(reader.sizes[0], INITIAL_TCP_BUFFER_SIZE);
+            if length < INITIAL_TCP_BUFFER_SIZE {
+                assert!(
+                    reader
+                        .sizes
+                        .iter()
+                        .all(|size| *size == INITIAL_TCP_BUFFER_SIZE)
+                );
+            } else {
+                assert_eq!(
+                    reader.sizes.iter().copied().max(),
+                    Some(MAX_TCP_BUFFER_SIZE)
+                );
+            }
         }
     }
 
@@ -1247,15 +1616,21 @@ mod tests {
             active: AtomicBool::new(true),
             stopped: CancellationToken::new(),
             address_index: 0,
-            address_count: 2,
+            addresses: Mutex::new(vec![destination, "127.0.0.2:9".parse().unwrap()]),
+            pending_lookup: Mutex::new(None),
         });
         let target = Target::from(destination);
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         let slot = Arc::new(FlowSlot {
+            id: NEXT_UDP_FLOW_ID.fetch_add(1, Ordering::Relaxed),
             flow: OnceCell::new(),
             _permit: permit,
         });
         assert!(slot.flow.set(Some(Arc::clone(&flow))).is_ok());
+        let preference = UdpPreference {
+            address: destination,
+            flow_id: slot.id,
+        };
         let association = Arc::new(Association {
             client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             requested_port: 0,
@@ -1263,7 +1638,7 @@ mod tests {
             alive: AtomicBool::new(true),
             stopped: CancellationToken::new(),
             flows: Mutex::new(HashMap::from([(target.clone(), slot)])),
-            preferred_addresses: Mutex::new(HashMap::new()),
+            preferred_addresses: Mutex::new(HashMap::from([(target.clone(), preference)])),
         });
         let relay = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         (association, flow, relay, target, destination)
@@ -1315,8 +1690,13 @@ mod tests {
             .unwrap();
         assert!(association.flows.lock().unwrap().is_empty());
         assert_eq!(
-            association.preferred_addresses.lock().unwrap().get(&target),
-            Some(&1)
+            association
+                .preferred_addresses
+                .lock()
+                .unwrap()
+                .get(&target)
+                .map(|preference| preference.address),
+            Some("127.0.0.2:9".parse().unwrap())
         );
     }
 

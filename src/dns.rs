@@ -6,14 +6,23 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::lookup_ip::LookupIp;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime, RuntimeFlavor};
 
 pub struct DnsResolver {
     runtime: Option<Runtime>,
     resolver: TokioResolver,
+}
+
+pub(crate) type PendingLookup = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
+
+pub(crate) struct UdpLookup {
+    pub addresses: Vec<SocketAddr>,
+    pub pending: Option<PendingLookup>,
 }
 
 impl DnsResolver {
@@ -79,6 +88,52 @@ impl DnsResolver {
         Ok(addresses)
     }
 
+    /// UDP 首包先使用已返回的地址，未完成的地址族由流的回复任务继续查询。
+    pub(crate) async fn lookup_udp(&self, target: &Target) -> io::Result<UdpLookup> {
+        let ip = match &target.host {
+            Host::Ip(ip) => Some(*ip),
+            Host::Domain(name) => name.parse().ok(),
+        };
+        if let Some(ip) = ip {
+            return Ok(UdpLookup {
+                addresses: vec![SocketAddr::new(ip, target.port)],
+                pending: None,
+            });
+        }
+        let Host::Domain(name) = &target.host else {
+            unreachable!()
+        };
+        let make_lookup = |ipv6| {
+            let resolver = self.resolver.clone();
+            let name = name.clone();
+            let port = target.port;
+            Box::pin(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    lookup_family(&resolver, &name, port, ipv6),
+                )
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP 目标域名解析超时"))?
+            }) as PendingLookup
+        };
+        let mut ipv6 = make_lookup(true);
+        let mut ipv4 = make_lookup(false);
+        let (first, pending) = tokio::select! {
+            result = &mut ipv6 => (result, ipv4),
+            result = &mut ipv4 => (result, ipv6),
+        };
+        match first {
+            Ok(addresses) => Ok(UdpLookup {
+                addresses,
+                pending: Some(pending),
+            }),
+            Err(_) => Ok(UdpLookup {
+                addresses: pending.await?,
+                pending: None,
+            }),
+        }
+    }
+
     /// 分别解析两个地址族，优先使用先返回的可连接地址建立 TCP 连接
     pub async fn connect_tcp(
         &self,
@@ -114,24 +169,7 @@ impl DnsResolver {
         port: u16,
         ipv6: bool,
     ) -> io::Result<Vec<SocketAddr>> {
-        // 两族查询共用解析器原有的缓存，由 Hickory 继续管理正负缓存与 TTL。
-        let lookup = if ipv6 {
-            self.resolver.ipv6_lookup(name).await
-        } else {
-            self.resolver.ipv4_lookup(name).await
-        }
-        .map_err(io::Error::other)?;
-        let addresses: Vec<_> = LookupIp::from(lookup)
-            .iter()
-            .map(|ip| SocketAddr::new(ip, port))
-            .collect();
-        if addresses.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "目标地址没有解析结果",
-            ));
-        }
-        Ok(addresses)
+        lookup_family(&self.resolver, name, port, ipv6).await
     }
 
     /// 同步阻塞解析目标地址（用于测试及外部同步兼容）
@@ -154,6 +192,32 @@ impl DnsResolver {
     }
 }
 
+pub(crate) async fn lookup_family(
+    resolver: &TokioResolver,
+    name: &str,
+    port: u16,
+    ipv6: bool,
+) -> io::Result<Vec<SocketAddr>> {
+    // 两族查询共用解析器原有的缓存，由 Hickory 继续管理正负缓存与 TTL。
+    let lookup = if ipv6 {
+        resolver.ipv6_lookup(name).await
+    } else {
+        resolver.ipv4_lookup(name).await
+    }
+    .map_err(io::Error::other)?;
+    let addresses: Vec<_> = LookupIp::from(lookup)
+        .iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "目标地址没有解析结果",
+        ));
+    }
+    Ok(addresses)
+}
+
 impl Drop for DnsResolver {
     fn drop(&mut self) {
         if let Some(rt) = self.runtime.take() {
@@ -165,7 +229,7 @@ impl Drop for DnsResolver {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::UdpSocket;
     use std::sync::Arc;
@@ -174,14 +238,14 @@ mod tests {
     use tokio::task::{JoinHandle, JoinSet};
 
     #[derive(Clone, Copy)]
-    enum DnsReply {
+    pub(crate) enum DnsReply {
         Answer(Duration),
         NoRecords(Duration),
         Drop,
     }
 
-    struct TestDns {
-        address: SocketAddr,
+    pub(crate) struct TestDns {
+        pub(crate) address: SocketAddr,
         queries: Arc<[AtomicUsize; 2]>,
         worker: JoinHandle<()>,
     }
@@ -192,7 +256,7 @@ mod tests {
         }
     }
 
-    async fn scripted_dns(ipv4: DnsReply, ipv6: DnsReply, ttl: u32) -> TestDns {
+    pub(crate) async fn scripted_dns(ipv4: DnsReply, ipv6: DnsReply, ttl: u32) -> TestDns {
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let address = socket.local_addr().unwrap();
         let queries = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
