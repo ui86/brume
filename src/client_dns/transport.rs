@@ -1,4 +1,5 @@
 use super::ResolverSnapshot;
+use crate::dns_transport::DnsTransport;
 use hickory_resolver::Resolver;
 use hickory_resolver::net::runtime::{RuntimeProvider, Spawn, TokioRuntimeProvider, TokioTime};
 use std::future::Future;
@@ -13,7 +14,7 @@ use tokio::task::JoinSet;
 const DNS_WORKERS: usize = 16;
 const DNS_TCP_SOCKETS: usize = 32;
 
-pub(super) type ClientResolver = Resolver<TrackedRuntime>;
+pub(super) type ClientResolver = Resolver<DnsTransport<TrackedRuntime>>;
 
 struct TransportState {
     tasks: Mutex<TransportTasks>,
@@ -179,11 +180,13 @@ impl DnsWorkers {
             Some(worker) if worker.generation == snapshot.loaded_at => worker,
             _ => {
                 let runtime = TrackedRuntime::new(Arc::clone(&self.0.tcp_slots));
-                let mut resolver =
-                    Resolver::builder_with_config(snapshot.config.clone(), runtime.clone())
-                        .with_options(snapshot.options.clone())
-                        .build()
-                        .map_err(io::Error::other)?;
+                let mut resolver = Resolver::builder_with_config(
+                    snapshot.config.clone(),
+                    DnsTransport(runtime.clone()),
+                )
+                .with_options(snapshot.options.clone())
+                .build()
+                .map_err(io::Error::other)?;
                 resolver.set_hosts(Arc::clone(&snapshot.hosts));
                 DnsWorker {
                     resolver,

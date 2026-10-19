@@ -1,3 +1,4 @@
+use crate::dns_transport::DnsTransport;
 use crate::happy_eyeballs::{happy_eyeballs_connect, happy_eyeballs_connect_resolving};
 use crate::protocol::{Host, Target};
 use hickory_resolver::config::{
@@ -5,7 +6,7 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::lookup_ip::LookupIp;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::{ConnectionProvider, Resolver, TokioResolver};
+use hickory_resolver::{ConnectionProvider, Resolver};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -15,7 +16,7 @@ use tokio::runtime::{Builder, Runtime, RuntimeFlavor};
 
 pub struct DnsResolver {
     runtime: Option<Runtime>,
-    resolver: TokioResolver,
+    resolver: Resolver<DnsTransport<TokioRuntimeProvider>>,
 }
 
 pub(crate) type PendingLookup = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
@@ -37,9 +38,9 @@ impl DnsResolver {
                 NameServerConfig::new(server.ip(), true, vec![udp, tcp])
             })
             .collect();
-        let mut builder = TokioResolver::builder_with_config(
+        let mut builder = Resolver::builder_with_config(
             ResolverConfig::from_name_servers(nameservers),
-            TokioRuntimeProvider::default(),
+            DnsTransport(TokioRuntimeProvider::default()),
         );
         let opts: &mut ResolverOpts = builder.options_mut();
         opts.timeout = Duration::from_secs(3);

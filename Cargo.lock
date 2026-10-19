@@ -39,6 +39,7 @@ name = "brume"
 version = "1.0.7"
 dependencies = [
  "ctrlc",
+ "futures-util",
  "hickory-resolver",
  "socket2",
  "tokio",
