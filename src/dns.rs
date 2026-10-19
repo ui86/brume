@@ -1,11 +1,13 @@
+use crate::happy_eyeballs::{happy_eyeballs_connect, happy_eyeballs_connect_resolving};
 use crate::protocol::{Host, Target};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
     ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts,
 };
+use hickory_resolver::lookup_ip::LookupIp;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime, RuntimeFlavor};
 
@@ -77,6 +79,61 @@ impl DnsResolver {
         Ok(addresses)
     }
 
+    /// 分别解析两个地址族，优先使用先返回的可连接地址建立 TCP 连接
+    pub async fn connect_tcp(
+        &self,
+        target: &Target,
+        total_timeout: Duration,
+    ) -> io::Result<tokio::net::TcpStream> {
+        match &target.host {
+            Host::Ip(ip) => {
+                happy_eyeballs_connect(&[SocketAddr::new(*ip, target.port)], total_timeout).await
+            }
+            Host::Domain(name) => {
+                // 域名类型携带 IP 字面量时保留原有 lookup_ip 的直接连接行为。
+                if let Ok(ip) = name.parse::<IpAddr>() {
+                    return happy_eyeballs_connect(
+                        &[SocketAddr::new(ip, target.port)],
+                        total_timeout,
+                    )
+                    .await;
+                }
+                happy_eyeballs_connect_resolving(
+                    self.lookup_family(name, target.port, true),
+                    self.lookup_family(name, target.port, false),
+                    total_timeout,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn lookup_family(
+        &self,
+        name: &str,
+        port: u16,
+        ipv6: bool,
+    ) -> io::Result<Vec<SocketAddr>> {
+        // 两族查询共用解析器原有的缓存，由 Hickory 继续管理正负缓存与 TTL。
+        let lookup = if ipv6 {
+            self.resolver.ipv6_lookup(name).await
+        } else {
+            self.resolver.ipv4_lookup(name).await
+        }
+        .map_err(io::Error::other)?;
+        let addresses: Vec<_> = LookupIp::from(lookup)
+            .iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "目标地址没有解析结果",
+            ));
+        }
+        Ok(addresses)
+    }
+
     /// 同步阻塞解析目标地址（用于测试及外部同步兼容）
     pub fn lookup_blocking(&self, target: &Target) -> io::Result<Vec<SocketAddr>> {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -114,6 +171,82 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
+    use tokio::task::{JoinHandle, JoinSet};
+
+    #[derive(Clone, Copy)]
+    enum DnsReply {
+        Answer(Duration),
+        NoRecords(Duration),
+        Drop,
+    }
+
+    struct TestDns {
+        address: SocketAddr,
+        queries: Arc<[AtomicUsize; 2]>,
+        worker: JoinHandle<()>,
+    }
+
+    impl Drop for TestDns {
+        fn drop(&mut self) {
+            self.worker.abort();
+        }
+    }
+
+    async fn scripted_dns(ipv4: DnsReply, ipv6: DnsReply, ttl: u32) -> TestDns {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let address = socket.local_addr().unwrap();
+        let queries = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let worker_queries = Arc::clone(&queries);
+        let worker = tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            let mut replies = JoinSet::new();
+            loop {
+                tokio::select! {
+                    Some(_) = replies.join_next(), if !replies.is_empty() => {}
+                    received = socket.recv_from(&mut buffer) => {
+                        let (length, source) = received.unwrap();
+                        let mut response = answer(&buffer[..length]).unwrap();
+                        let mut end = 12;
+                        while buffer[end] != 0 {
+                            end += usize::from(buffer[end]) + 1;
+                        }
+                        let question_end = end + 5;
+                        let family = usize::from(buffer[end + 1..end + 3] == [0, 28]);
+                        worker_queries[family].fetch_add(1, Ordering::Relaxed);
+                        let (delay, no_records) = match [ipv4, ipv6][family] {
+                            DnsReply::Answer(delay) => (delay, false),
+                            DnsReply::NoRecords(delay) => (delay, true),
+                            DnsReply::Drop => continue,
+                        };
+                        if no_records {
+                            response[6..8].copy_from_slice(&[0, 0]);
+                            response.truncate(question_end);
+                        } else {
+                            response[question_end + 6..question_end + 10]
+                                .copy_from_slice(&ttl.to_be_bytes());
+                        }
+                        let socket = Arc::clone(&socket);
+                        replies.spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            socket.send_to(&response, source).await.unwrap();
+                        });
+                    }
+                }
+            }
+        });
+        TestDns {
+            address,
+            queries,
+            worker,
+        }
+    }
+
+    fn tcp_target(port: u16) -> Target {
+        Target {
+            host: Host::Domain("progressive-dns.example.".into()),
+            port,
+        }
+    }
 
     fn answer(query: &[u8]) -> Option<Vec<u8>> {
         if query.len() < 17 {
@@ -220,5 +353,174 @@ mod tests {
         assert_eq!(queries.load(Ordering::Relaxed), first_queries);
         done.store(true, Ordering::Relaxed);
         worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_uses_ipv4_while_aaaa_queries_are_dropped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.42:0").await.unwrap();
+        let dns = scripted_dns(DnsReply::Answer(Duration::ZERO), DnsReply::Drop, 60).await;
+        let resolver = DnsResolver::new(&[dns.address]).unwrap();
+        let target = tcp_target(listener.local_addr().unwrap().port());
+
+        let stream = tokio::time::timeout(
+            Duration::from_millis(700),
+            resolver.connect_tcp(&target, Duration::from_secs(2)),
+        )
+        .await
+        .expect("可用 IPv4 地址被丢弃的 AAAA 查询阻塞")
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+        assert!(dns.queries[0].load(Ordering::Relaxed) >= 1);
+        assert!(dns.queries[1].load(Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_keeps_ip_literals_in_domain_targets_without_dns() {
+        let dns = scripted_dns(DnsReply::Drop, DnsReply::Drop, 60).await;
+        let resolver = DnsResolver::new(&[dns.address]).unwrap();
+        for address in ["127.0.0.42:0", "[::1]:0"] {
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let target = Target {
+                host: Host::Domain(address.ip().to_string()),
+                port: address.port(),
+            };
+            let stream = resolver
+                .connect_tcp(&target, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert_eq!(stream.peer_addr().unwrap(), address);
+        }
+        assert_eq!(dns.queries[0].load(Ordering::Relaxed), 0);
+        assert_eq!(dns.queries[1].load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_uses_ipv6_while_a_queries_are_dropped() {
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let dns = scripted_dns(DnsReply::Drop, DnsReply::Answer(Duration::ZERO), 60).await;
+        let resolver = DnsResolver::new(&[dns.address]).unwrap();
+        let target = tcp_target(listener.local_addr().unwrap().port());
+
+        let stream = tokio::time::timeout(
+            Duration::from_millis(700),
+            resolver.connect_tcp(&target, Duration::from_secs(2)),
+        )
+        .await
+        .expect("可用 IPv6 地址被丢弃的 A 查询阻塞")
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+        assert!(dns.queries[0].load(Ordering::Relaxed) >= 1);
+        assert!(dns.queries[1].load(Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_keeps_delayed_other_family_when_first_address_is_unavailable() {
+        for available_ipv6 in [false, true] {
+            let address = if available_ipv6 {
+                "[::1]:0"
+            } else {
+                "127.0.0.42:0"
+            };
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let delayed = DnsReply::Answer(Duration::from_millis(120));
+            let immediate = DnsReply::Answer(Duration::ZERO);
+            let (ipv4, ipv6) = if available_ipv6 {
+                (immediate, delayed)
+            } else {
+                (delayed, immediate)
+            };
+            let dns = scripted_dns(ipv4, ipv6, 60).await;
+            let resolver = DnsResolver::new(&[dns.address]).unwrap();
+            let target = tcp_target(listener.local_addr().unwrap().port());
+
+            let stream = resolver
+                .connect_tcp(&target, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+            assert!(dns.queries[0].load(Ordering::Relaxed) >= 1);
+            assert!(dns.queries[1].load(Ordering::Relaxed) >= 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_uses_cached_answers_until_ttl_expires() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.42:0").await.unwrap();
+        let dns = scripted_dns(DnsReply::Answer(Duration::ZERO), DnsReply::Drop, 1).await;
+        let resolver = DnsResolver::new(&[dns.address]).unwrap();
+        let target = tcp_target(listener.local_addr().unwrap().port());
+
+        resolver
+            .connect_tcp(&target, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let first_queries = dns.queries[0].load(Ordering::Relaxed);
+        resolver
+            .connect_tcp(&target, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(dns.queries[0].load(Ordering::Relaxed), first_queries);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        resolver
+            .connect_tcp(&target, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(dns.queries[0].load(Ordering::Relaxed) > first_queries);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_total_timeout_includes_dns() {
+        let dns = scripted_dns(DnsReply::Drop, DnsReply::Drop, 60).await;
+        let resolver = DnsResolver::new(&[dns.address]).unwrap();
+        let target = tcp_target(443);
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(700),
+            resolver.connect_tcp(&target, Duration::from_millis(120)),
+        )
+        .await
+        .expect("DNS 查询超出了 TCP 连接总预算")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "连接目标超时");
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_preserves_dns_no_records_error() {
+        let no_records = DnsReply::NoRecords(Duration::ZERO);
+        let dns = scripted_dns(no_records, no_records, 60).await;
+        let resolver = DnsResolver::new(&[dns.address]).unwrap();
+
+        let error = resolver
+            .connect_tcp(&tcp_target(443), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<hickory_resolver::net::NetError>())
+                .is_some_and(hickory_resolver::net::NetError::is_no_records_found)
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_preserves_connection_refused_over_other_family_dns_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.42:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let dns = scripted_dns(
+            DnsReply::Answer(Duration::ZERO),
+            DnsReply::NoRecords(Duration::from_millis(120)),
+            60,
+        )
+        .await;
+        let resolver = DnsResolver::new(&[dns.address]).unwrap();
+
+        let error = resolver
+            .connect_tcp(&tcp_target(port), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     }
 }

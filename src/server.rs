@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::dns::DnsResolver;
-use crate::happy_eyeballs::happy_eyeballs_connect;
 use crate::protocol::{self, Host, Target};
 use hickory_resolver::net::NetError;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -484,17 +483,8 @@ async fn connect(
 ) -> io::Result<()> {
     let connect_task = async {
         let address = unspecified(client.local_addr()?.ip());
-        let addresses = match dns.lookup(&target).await {
-            Ok(addresses) => addresses,
-            Err(error) => {
-                protocol::write_reply_async(&mut client, protocol::HOST_UNREACHABLE, address)
-                    .await?;
-                return Err(error);
-            }
-        };
-
-        // 使用 Happy Eyeballs 双栈并发竞速建立连接
-        let mut remote = match happy_eyeballs_connect(&addresses, HANDSHAKE_TIMEOUT).await {
+        // 可用地址族解析完成后立即连接，解析和建连共用总时限。
+        let mut remote = match dns.connect_tcp(&target, HANDSHAKE_TIMEOUT).await {
             Ok(stream) => stream,
             Err(error) => {
                 let status = if error.kind() == io::ErrorKind::ConnectionRefused {

@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -61,6 +62,71 @@ pub async fn happy_eyeballs_connect(
     let ordered = interleave_addresses(addresses);
 
     tokio::time::timeout(total_timeout, race_connect(ordered))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))?
+}
+
+enum FamilyConnectError {
+    Resolve(io::Error),
+    Connect(io::Error),
+}
+
+/// 各地址族解析完成后立即连接，另一族保留到成功或全部失败
+pub(crate) async fn happy_eyeballs_connect_resolving<V6, V4>(
+    ipv6: V6,
+    ipv4: V4,
+    total_timeout: Duration,
+) -> io::Result<TcpStream>
+where
+    V6: Future<Output = io::Result<Vec<SocketAddr>>>,
+    V4: Future<Output = io::Result<Vec<SocketAddr>>>,
+{
+    async fn connect_family(
+        lookup: impl Future<Output = io::Result<Vec<SocketAddr>>>,
+        timeout: Duration,
+    ) -> Result<TcpStream, FamilyConnectError> {
+        let addresses = lookup.await.map_err(FamilyConnectError::Resolve)?;
+        happy_eyeballs_connect(&addresses, timeout)
+            .await
+            .map_err(FamilyConnectError::Connect)
+    }
+
+    let race = async {
+        let ipv6 = connect_family(ipv6, total_timeout);
+        let ipv4 = connect_family(ipv4, total_timeout);
+        tokio::pin!(ipv6, ipv4);
+        let (first, second) = tokio::select! {
+            result = &mut ipv6 => match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => (error, ipv4.await),
+            },
+            result = &mut ipv4 => match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => (error, ipv6.await),
+            },
+        };
+        match second {
+            Ok(stream) => Ok(stream),
+            Err(second) => {
+                // 已尝试连接时优先保留连接错误，避免无记录响应掩盖连接拒绝。
+                let error = match (first, second) {
+                    (FamilyConnectError::Connect(first), FamilyConnectError::Connect(second)) => {
+                        if first.kind() == io::ErrorKind::ConnectionRefused {
+                            first
+                        } else {
+                            second
+                        }
+                    }
+                    (FamilyConnectError::Connect(error), _)
+                    | (_, FamilyConnectError::Connect(error))
+                    | (_, FamilyConnectError::Resolve(error)) => error,
+                };
+                Err(error)
+            }
+        }
+    };
+    // 总预算同时覆盖解析与连接，避免 DNS 重试额外延长连接超时。
+    tokio::time::timeout(total_timeout, race)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))?
 }
