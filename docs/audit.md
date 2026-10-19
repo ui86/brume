@@ -42,7 +42,7 @@
 
 - 拒绝端口 `0` 是明确的安全兼容性取舍：只发送该端口的通用客户端会失败，NAT 改写 UDP 来源端口也无法匹配。兼容这些场景需要独立关联中继端口及对应的防火墙规划。
 - 客户端读取系统 DNS、搜索域和 hosts 配置，但不执行系统的 NSS、mDNS、LLMNR、NRPT、按接口拆分 DNS 或系统 DoH 策略；依赖这些机制的名称需要显式 IP、hosts 或可直接访问的 DNS 记录。
-- 修改失败后的系统配置和服务恢复是尽力执行；恢复失败时保留私有备份和日志，仍需管理员根据日志处理。防火墙已在隔离 Linux 环境验证，真实 systemd 服务事务仍待 CI 执行。
+- 修改失败后的系统配置和服务恢复是尽力执行；恢复失败时保留私有备份和日志，仍需管理员根据日志处理。防火墙已在隔离 Linux 环境验证，真实 systemd 服务事务也已通过 CI。
 - 默认空白名单和空认证允许所有来源，用户名密码按 SOCKS5 标准明文传输；这些是现有配置与协议行为，部署方式见[使用说明](usage.md)。
 
 ## 验证记录
@@ -53,7 +53,7 @@
 - 最新静态链接库测试程序在 Alpine Linux 中运行，81 项全部通过；该环境未提供 `/etc/resolv.conf`，已实际覆盖 hosts 兼容修复。
 - `bash -n install.sh` 及 9 个普通 Bash 回归通过；真实 `flock` 进程继承已在 Linux 验证，移除锁关闭逻辑的反例也能检出泄漏。
 - 临时 Alpine Linux 虚拟机已验证真实文件描述符耗尽与恢复、独立网络命名空间中 nftables 和 iptables 的 IPv4/IPv6 TCP/UDP 允许、拒绝、重复应用及移除；未修改 Windows 宿主防火墙或服务。
-- Linux 专属 CI 已增加上述实际测试，以及临时 systemd 服务的配置应用、重启失败和状态检查失败的事务恢复。真实 systemd 测试尚待 CI 执行。
+- Linux 专属 CI 已通过上述实际测试，以及临时 systemd 服务的配置应用、重启失败和状态检查失败的事务恢复，见[实际运行记录](https://github.com/ui86/brume/actions/runs/39245972257/job/118037837532)。
 - `cargo check --locked --all-targets --all-features --target x86_64-unknown-linux-musl`：Linux 目标交叉检查通过。
 - `cargo bench --locked --features performance-bench --bench benchmarks`：优化构建的基准支持按场景分组；本轮网络参考值及白名单单独对照见[性能说明](performance.md)，网络数据不用于跨轮宣称性能提升。
 
