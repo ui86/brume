@@ -7,7 +7,7 @@ use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::{Builder, Runtime, RuntimeFlavor};
 
 pub struct DnsResolver {
     runtime: Option<Runtime>,
@@ -80,6 +80,13 @@ impl DnsResolver {
     /// 同步阻塞解析目标地址（用于测试及外部同步兼容）
     pub fn lookup_blocking(&self, target: &Target) -> io::Result<Vec<SocketAddr>> {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // 单线程运行时不能临时阻塞工作线程，调用方应改用异步解析接口
+            if handle.runtime_flavor() != RuntimeFlavor::MultiThread {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "当前运行时不支持阻塞解析，请改用异步 lookup 方法",
+                ));
+            }
             tokio::task::block_in_place(|| handle.block_on(self.lookup(target)))
         } else if let Some(ref rt) = self.runtime {
             rt.block_on(self.lookup(target))
@@ -133,6 +140,42 @@ mod tests {
             response.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         }
         Some(response)
+    }
+
+    #[tokio::test]
+    async fn blocking_lookup_rejects_current_thread_runtime_without_panicking() {
+        let resolver = DnsResolver::new(&["127.0.0.1:53".parse().unwrap()]).unwrap();
+        let target = Target::from("127.0.0.42:443".parse::<SocketAddr>().unwrap());
+
+        let error = resolver.lookup_blocking(&target).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("lookup"));
+        assert_eq!(
+            resolver.lookup(&target).await.unwrap(),
+            vec!["127.0.0.42:443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_lookup_remains_available_in_multi_thread_runtime() {
+        let resolver = DnsResolver::new(&["127.0.0.1:53".parse().unwrap()]).unwrap();
+        let target = Target::from("127.0.0.42:443".parse::<SocketAddr>().unwrap());
+
+        assert_eq!(
+            resolver.lookup_blocking(&target).unwrap(),
+            vec!["127.0.0.42:443".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn blocking_lookup_remains_available_without_runtime() {
+        let resolver = DnsResolver::new(&["127.0.0.1:53".parse().unwrap()]).unwrap();
+        let target = Target::from("127.0.0.42:443".parse::<SocketAddr>().unwrap());
+
+        assert_eq!(
+            resolver.lookup_blocking(&target).unwrap(),
+            vec!["127.0.0.42:443".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     #[tokio::test]

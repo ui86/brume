@@ -1,7 +1,7 @@
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -256,12 +256,18 @@ impl Config {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.username.is_empty() != self.password.is_empty() {
             return Err("用户名和密码必须同时设置".into());
         }
         if self.username.len() > 255 || self.password.len() > 255 {
             return Err("用户名和密码不能超过 255 字节".into());
+        }
+        let now = Instant::now();
+        for (name, timeout) in [("TCP", self.tcp_timeout), ("UDP", Some(self.udp_timeout))] {
+            if timeout.is_some_and(|timeout| now.checked_add(timeout).is_none()) {
+                return Err(format!("{name} 超时超过系统时钟支持的范围"));
+            }
         }
         Ok(())
     }
@@ -335,6 +341,22 @@ mod tests {
         assert_eq!(config.port, 8080);
         assert!(!config.whitelist.is_empty());
         assert!(Config::parse(["-user", "admin"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn timeout_values_respect_clock_range() {
+        for option in ["--tcp-timeout", "--udp-timeout"] {
+            assert!(Config::parse([format!("{option}={}", u64::MAX)]).is_err());
+            for seconds in [0, 1, 31_536_000] {
+                assert!(Config::parse([format!("{option}={seconds}")]).is_ok());
+            }
+        }
+        let mut config = Config::parse([]).unwrap().unwrap();
+        config.tcp_timeout = Some(Duration::from_secs(u64::MAX));
+        assert!(config.validate().is_err());
+        config.tcp_timeout = None;
+        config.udp_timeout = Duration::from_secs(u64::MAX);
+        assert!(config.validate().is_err());
     }
 
     #[test]
