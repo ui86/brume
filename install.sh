@@ -30,12 +30,35 @@ if command -v sudo &> /dev/null; then
 fi
 
 # 执行特权命令的辅助函数
-execute_privileged() {
+execute_privileged() (
+    # 服务管理器可能启动常驻进程，不能让其继承安装事务锁
+    if [ -n "${mutation_lock_fd:-}" ]; then
+        exec {mutation_lock_fd}>&-
+    fi
     if [ "$has_sudo" = true ]; then
         sudo "$@"
     else
         "$@"
     fi
+)
+
+# 修改与升级共用同一把锁，持锁描述符可交给独立工作进程继续保有
+acquire_mutation_lock() {
+    if ! command -v flock >/dev/null; then
+        echo "修改和升级需要 flock，请先安装对应系统工具。" >&2
+        return 1
+    fi
+    mkdir -p -m 700 "${CONFIG_DIR}" && chmod 700 "${CONFIG_DIR}" || return 1
+    exec {mutation_lock_fd}>"${CONFIG_DIR}/.mutation.lock" || return 1
+    if ! flock -n "${mutation_lock_fd}"; then
+        exec {mutation_lock_fd}>&-
+        echo "另一个配置修改或升级事务正在执行，请稍后重试。" >&2
+        return 1
+    fi
+}
+
+validate_mutation_lock() {
+    [[ "${mutation_lock_fd:-}" =~ ^[0-9]+$ ]] && flock -n "${mutation_lock_fd}"
 }
 
 # 将完整配置原子写入仅 root 可读的文件
@@ -174,8 +197,8 @@ EOF
         exit 1
     fi
 
-    execute_privileged systemctl daemon-reload
-    execute_privileged systemctl enable "${SERVICE_NAME}"
+    execute_privileged systemctl daemon-reload || return 1
+    execute_privileged systemctl enable "${SERVICE_NAME}" || return 1
 
     echo -e "${GREEN}systemd 服务创建成功${RESET}"
 }
@@ -206,8 +229,8 @@ EOF
         exit 1
     fi
 
-    execute_privileged chmod +x "${service_file}"
-    execute_privileged rc-update add "${SERVICE_NAME}" default 2>/dev/null
+    execute_privileged chmod +x "${service_file}" || return 1
+    execute_privileged rc-update add "${SERVICE_NAME}" default 2>/dev/null || return 1
 
     echo -e "${GREEN}OpenRC 服务创建成功${RESET}"
 }
@@ -289,17 +312,17 @@ OUTER_EOF
     fi
 
     # 替换占位符为实际值
-    execute_privileged sed -i "s|PLACEHOLDER_INSTALL_DIR|${INSTALL_DIR}|g" "${service_file}"
-    execute_privileged sed -i "s|PLACEHOLDER_CONFIG_FILE|${CONFIG_FILE}|g" "${service_file}"
+    execute_privileged sed -i "s|PLACEHOLDER_INSTALL_DIR|${INSTALL_DIR}|g" "${service_file}" || return 1
+    execute_privileged sed -i "s|PLACEHOLDER_CONFIG_FILE|${CONFIG_FILE}|g" "${service_file}" || return 1
 
-    execute_privileged chmod +x "${service_file}"
+    execute_privileged chmod +x "${service_file}" || return 1
 
     # 尝试使用 update-rc.d 或 chkconfig 注册开机自启
     if command -v update-rc.d &> /dev/null; then
-        execute_privileged update-rc.d "${SERVICE_NAME}" defaults 2>/dev/null
+        execute_privileged update-rc.d "${SERVICE_NAME}" defaults 2>/dev/null || return 1
     elif command -v chkconfig &> /dev/null; then
-        execute_privileged chkconfig --add "${SERVICE_NAME}" 2>/dev/null
-        execute_privileged chkconfig "${SERVICE_NAME}" on 2>/dev/null
+        execute_privileged chkconfig --add "${SERVICE_NAME}" 2>/dev/null || return 1
+        execute_privileged chkconfig "${SERVICE_NAME}" on 2>/dev/null || return 1
     fi
 
     echo -e "${GREEN}SysVinit 服务创建成功${RESET}"
@@ -410,21 +433,24 @@ restart_service_by_init() {
     echo -e "${GREEN}服务重启成功${RESET}"
 }
 
-# 更新的重启交给独立进程，避免代理断开后中断安装脚本
-schedule_upgrade_restart() {
-    local init_system=$1
+# 独立工作进程完成升级重启及状态检查后才释放事务锁
+schedule_upgrade_restart() (
+    local init_system=$1 transaction_dir log_file scheduled=false
+    transaction_dir=$(mktemp -d "${CONFIG_DIR}/.upgrade.XXXXXX") || return 1
+    trap 'if [ "${scheduled}" != true ] && [ ! -f "${transaction_dir}/go" ]; then cleanup_modify_transaction "${transaction_dir}"; fi' EXIT
+    cp -- "${BASH_SOURCE[0]}" "${transaction_dir}/installer.sh" || return 1
+    log_file=$(mktemp "${CONFIG_DIR}/upgrade.XXXXXX.log") || return 1
+    schedule_independent_worker "${transaction_dir}" "${init_system}" "${log_file}" --restart-upgrade || return 1
+    scheduled=true
     echo "正在安排服务重启；经过 Brume 的 SSH 连接可能短暂断开，请稍后重连。"
-    case "${init_system}" in
-        systemd)
-            execute_privileged systemctl restart --no-block "${SERVICE_NAME}"
-            ;;
-        openrc)
-            nohup sh -c 'sleep 1; rc-service brume restart' </dev/null >/var/log/brume-upgrade.log 2>&1 &
-            ;;
-        sysvinit)
-            nohup sh -c 'sleep 1; /etc/init.d/brume restart' </dev/null >/var/log/brume-upgrade.log 2>&1 &
-            ;;
-    esac
+    echo "升级重启结果日志：${log_file}"
+)
+
+require_independent_worker_tools() {
+    if ! command -v setsid >/dev/null || ! command -v nohup >/dev/null; then
+        echo "修改和升级需要 setsid 和 nohup，请先安装对应系统工具。" >&2
+        return 1
+    fi
 }
 
 # 根据 init 系统卸载服务
@@ -553,10 +579,10 @@ setup_firewall_firewalld() {
     echo -e "${CYAN}使用 firewalld 配置防火墙规则...${RESET}"
 
     # 先移除已有的 Brume zone 和规则（幂等操作）
-    remove_firewall_firewalld "${port}" 2>/dev/null
+    remove_firewall_firewalld "${port}" 2>/dev/null || return 1
 
     # 创建专用 zone
-    execute_privileged firewall-cmd --permanent --new-zone=brume 2>/dev/null
+    execute_privileged firewall-cmd --permanent --new-zone=brume 2>/dev/null || return 1
 
     # 解析白名单并添加 rich rules
     IFS=',' read -ra IPS <<< "${whitelist}"
@@ -567,18 +593,18 @@ setup_firewall_firewalld() {
         [[ "${ip}" == *:* ]] && family=ipv6
         echo "  允许 ${ip} 访问端口 ${port}..."
         execute_privileged firewall-cmd --permanent --zone=brume \
-            --add-rich-rule="rule family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
+            --add-rich-rule="rule family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept" || return 1
         execute_privileged firewall-cmd --permanent --zone=brume \
-            --add-rich-rule="rule family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept"
+            --add-rich-rule="rule family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept" || return 1
     done
 
     # 将接口绑定到 brume zone（如果需要可以指定接口）
     # 使用默认 zone 来添加拒绝规则
     for family in ipv4 ipv6; do
         execute_privileged firewall-cmd --permanent --zone=public \
-            --add-rich-rule="rule priority=\"10\" family=\"${family}\" port port=\"${port}\" protocol=\"tcp\" drop"
+            --add-rich-rule="rule priority=\"10\" family=\"${family}\" port port=\"${port}\" protocol=\"tcp\" drop" || return 1
         execute_privileged firewall-cmd --permanent --zone=public \
-            --add-rich-rule="rule priority=\"10\" family=\"${family}\" port port=\"${port}\" protocol=\"udp\" drop"
+            --add-rich-rule="rule priority=\"10\" family=\"${family}\" port port=\"${port}\" protocol=\"udp\" drop" || return 1
     done
 
     # 在 public zone 中添加白名单 IP 的放行规则（优先级更高）
@@ -588,12 +614,12 @@ setup_firewall_firewalld() {
         local family=ipv4
         [[ "${ip}" == *:* ]] && family=ipv6
         execute_privileged firewall-cmd --permanent --zone=public \
-            --add-rich-rule="rule priority=\"-10\" family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept"
+            --add-rich-rule="rule priority=\"-10\" family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"tcp\" accept" || return 1
         execute_privileged firewall-cmd --permanent --zone=public \
-            --add-rich-rule="rule priority=\"-10\" family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept"
+            --add-rich-rule="rule priority=\"-10\" family=\"${family}\" source address=\"${ip}\" port port=\"${port}\" protocol=\"udp\" accept" || return 1
     done
 
-    execute_privileged firewall-cmd --reload
+    execute_privileged firewall-cmd --reload || return 1
 
     echo -e "${GREEN}firewalld 防火墙规则配置完成${RESET}"
 }
@@ -612,7 +638,7 @@ setup_firewall_ufw() {
     fi
 
     # 先清除已有规则
-    remove_firewall_ufw "${port}" 2>/dev/null
+    remove_firewall_ufw "${port}" 2>/dev/null || return 1
 
     # 添加白名单 IP 的放行规则
     IFS=',' read -ra IPS <<< "${whitelist}"
@@ -621,13 +647,13 @@ setup_firewall_ufw() {
         [ -z "${ip}" ] && continue
         echo "  允许 ${ip} 访问端口 ${port}..."
         # 添加注释标识规则来源
-        execute_privileged ufw allow from "${ip}" to any port "${port}" proto tcp comment "brume-whitelist"
-        execute_privileged ufw allow from "${ip}" to any port "${port}" proto udp comment "brume-whitelist"
+        execute_privileged ufw allow from "${ip}" to any port "${port}" proto tcp comment "brume-whitelist" || return 1
+        execute_privileged ufw allow from "${ip}" to any port "${port}" proto udp comment "brume-whitelist" || return 1
     done
 
     # 拒绝其他所有连接到该端口
-    execute_privileged ufw deny to any port "${port}" proto tcp comment "brume-deny-default"
-    execute_privileged ufw deny to any port "${port}" proto udp comment "brume-deny-default"
+    execute_privileged ufw deny to any port "${port}" proto tcp comment "brume-deny-default" || return 1
+    execute_privileged ufw deny to any port "${port}" proto udp comment "brume-deny-default" || return 1
 
     echo -e "${GREEN}ufw 防火墙规则配置完成${RESET}"
 }
@@ -640,11 +666,11 @@ setup_firewall_nftables() {
     echo -e "${CYAN}使用 nftables 配置防火墙规则...${RESET}"
 
     # 先清除已有规则
-    remove_firewall_nftables 2>/dev/null
+    remove_firewall_nftables 2>/dev/null || return 1
 
     # 创建 Brume 专用规则表
-    execute_privileged nft add table inet brume
-    execute_privileged nft add chain inet brume input '{ type filter hook input priority 0; policy accept; }'
+    execute_privileged nft add table inet brume || return 1
+    execute_privileged nft add chain inet brume input '{ type filter hook input priority 0; policy accept; }' || return 1
 
     # 添加白名单 IP 的放行规则
     IFS=',' read -ra IPS <<< "${whitelist}"
@@ -654,13 +680,13 @@ setup_firewall_nftables() {
         local address_family=ip
         [[ "${ip}" == *:* ]] && address_family=ip6
         echo "  允许 ${ip} 访问端口 ${port}..."
-        execute_privileged nft add rule inet brume input "${address_family}" saddr "${ip}" tcp dport "${port}" accept
-        execute_privileged nft add rule inet brume input "${address_family}" saddr "${ip}" udp dport "${port}" accept
+        execute_privileged nft add rule inet brume input "${address_family}" saddr "${ip}" tcp dport "${port}" accept || return 1
+        execute_privileged nft add rule inet brume input "${address_family}" saddr "${ip}" udp dport "${port}" accept || return 1
     done
 
     # 拒绝其他所有到该端口的连接
-    execute_privileged nft add rule inet brume input tcp dport "${port}" drop
-    execute_privileged nft add rule inet brume input udp dport "${port}" drop
+    execute_privileged nft add rule inet brume input tcp dport "${port}" drop || return 1
+    execute_privileged nft add rule inet brume input udp dport "${port}" drop || return 1
 
     # 导出失败时保留原配置，临时文件只允许当前用户访问
     persist_nftables_rules /etc/nftables.conf || return 1
@@ -686,20 +712,20 @@ setup_firewall_iptables() {
     echo -e "${CYAN}使用 iptables 配置防火墙规则...${RESET}"
 
     # 先清除已有规则
-    remove_firewall_iptables "${port}" 2>/dev/null
+    remove_firewall_iptables "${port}" 2>/dev/null || return 1
 
     # 创建自定义 chain
-    execute_privileged iptables -N "${IPTABLES_CHAIN}" 2>/dev/null
+    execute_privileged iptables -N "${IPTABLES_CHAIN}" 2>/dev/null || return 1
     if [ "${has_ip6tables}" = true ]; then
-        execute_privileged ip6tables -N "${IPTABLES_CHAIN}" 2>/dev/null
+        execute_privileged ip6tables -N "${IPTABLES_CHAIN}" 2>/dev/null || return 1
     fi
 
     # 将针对目标端口的流量导向自定义 chain
-    execute_privileged iptables -I INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}"
-    execute_privileged iptables -I INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}"
+    execute_privileged iptables -I INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}" || return 1
+    execute_privileged iptables -I INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}" || return 1
     if [ "${has_ip6tables}" = true ]; then
-        execute_privileged ip6tables -I INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}"
-        execute_privileged ip6tables -I INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}"
+        execute_privileged ip6tables -I INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}" || return 1
+        execute_privileged ip6tables -I INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}" || return 1
     fi
 
     # 添加白名单 IP 的放行规则
@@ -709,24 +735,24 @@ setup_firewall_iptables() {
         [ -z "${ip}" ] && continue
         echo "  允许 ${ip} 访问端口 ${port}..."
         if [[ "${ip}" == *:* ]]; then
-            execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -s "${ip}" -p tcp --dport "${port}" -j ACCEPT
-            execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -s "${ip}" -p udp --dport "${port}" -j ACCEPT
+            execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -s "${ip}" -p tcp --dport "${port}" -j ACCEPT || return 1
+            execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -s "${ip}" -p udp --dport "${port}" -j ACCEPT || return 1
         else
-            execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p tcp --dport "${port}" -j ACCEPT
-            execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p udp --dport "${port}" -j ACCEPT
+            execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p tcp --dport "${port}" -j ACCEPT || return 1
+            execute_privileged iptables -A "${IPTABLES_CHAIN}" -s "${ip}" -p udp --dport "${port}" -j ACCEPT || return 1
         fi
     done
 
     # 拒绝其他所有到该端口的连接
-    execute_privileged iptables -A "${IPTABLES_CHAIN}" -p tcp --dport "${port}" -j DROP
-    execute_privileged iptables -A "${IPTABLES_CHAIN}" -p udp --dport "${port}" -j DROP
+    execute_privileged iptables -A "${IPTABLES_CHAIN}" -p tcp --dport "${port}" -j DROP || return 1
+    execute_privileged iptables -A "${IPTABLES_CHAIN}" -p udp --dport "${port}" -j DROP || return 1
     if [ "${has_ip6tables}" = true ]; then
-        execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -p tcp --dport "${port}" -j DROP
-        execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -p udp --dport "${port}" -j DROP
+        execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -p tcp --dport "${port}" -j DROP || return 1
+        execute_privileged ip6tables -A "${IPTABLES_CHAIN}" -p udp --dport "${port}" -j DROP || return 1
     fi
 
     # 持久化 iptables 规则
-    persist_iptables_rules
+    persist_iptables_rules || return 1
 
     echo -e "${GREEN}iptables 防火墙规则配置完成${RESET}"
 }
@@ -751,19 +777,19 @@ persist_nftables_rules() (
 # 持久化 iptables 规则
 persist_iptables_rules() {
     if command -v netfilter-persistent &> /dev/null; then
-        execute_privileged netfilter-persistent save 2>/dev/null
+        execute_privileged netfilter-persistent save 2>/dev/null || return 1
     elif command -v iptables-save &> /dev/null; then
         # Debian/Ubuntu
         if [ -d /etc/iptables ]; then
-            execute_privileged sh -c "iptables-save > /etc/iptables/rules.v4"
+            execute_privileged sh -c "iptables-save > /etc/iptables/rules.v4" || return 1
             if command -v ip6tables-save &> /dev/null; then
-                execute_privileged sh -c "ip6tables-save > /etc/iptables/rules.v6"
+                execute_privileged sh -c "ip6tables-save > /etc/iptables/rules.v6" || return 1
             fi
         # CentOS/RHEL
         elif [ -d /etc/sysconfig ]; then
-            execute_privileged sh -c "iptables-save > /etc/sysconfig/iptables"
+            execute_privileged sh -c "iptables-save > /etc/sysconfig/iptables" || return 1
             if command -v ip6tables-save &> /dev/null; then
-                execute_privileged sh -c "ip6tables-save > /etc/sysconfig/ip6tables"
+                execute_privileged sh -c "ip6tables-save > /etc/sysconfig/ip6tables" || return 1
             fi
         fi
     fi
@@ -775,53 +801,65 @@ persist_iptables_rules() {
 
 # 移除 firewalld 规则
 remove_firewall_firewalld() {
-    local port=$1
+    local port=$1 rules rule zones zone
 
     echo -e "${CYAN}移除 firewalld 防火墙规则...${RESET}"
 
     # 如果不知道端口，尝试从服务中获取
     if [ -z "${port}" ]; then
-        port=$(get_current_port)
+        port=$(get_current_port) || return 1
     fi
 
     if [ -n "${port}" ]; then
         # 移除 public zone 中所有 brume 相关的 rich rules
-        local rules
-        rules=$(execute_privileged firewall-cmd --permanent --zone=public --list-rich-rules 2>/dev/null | grep "port=\"${port}\"")
+        rules=$(execute_privileged firewall-cmd --permanent --zone=public --list-rich-rules) || return 1
         while IFS= read -r rule; do
-            [ -z "${rule}" ] && continue
-            execute_privileged firewall-cmd --permanent --zone=public --remove-rich-rule="${rule}" 2>/dev/null
+            [[ "${rule}" == *"port=\"${port}\""* ]] || continue
+            execute_privileged firewall-cmd --permanent --zone=public --remove-rich-rule="${rule}" || return 1
         done <<< "${rules}"
     fi
 
-    # 删除 brume zone
-    execute_privileged firewall-cmd --permanent --delete-zone=brume 2>/dev/null
-    execute_privileged firewall-cmd --reload 2>/dev/null
+    # 先查询再删除，只有确认区域不存在时才按幂等成功处理。
+    zones=$(execute_privileged firewall-cmd --permanent --get-zones) || return 1
+    for zone in ${zones}; do
+        if [ "${zone}" = brume ]; then
+            execute_privileged firewall-cmd --permanent --delete-zone=brume || return 1
+            break
+        fi
+    done
+    execute_privileged firewall-cmd --reload || return 1
 
     echo -e "${GREEN}firewalld 规则已清除${RESET}"
 }
 
 # 移除 ufw 规则
 remove_firewall_ufw() {
-    local port=$1
+    local port=$1 status line number rule_nums
+    local -a matching_rules=()
 
     echo -e "${CYAN}移除 ufw 防火墙规则...${RESET}"
 
     if [ -z "${port}" ]; then
-        port=$(get_current_port)
+        port=$(get_current_port) || return 1
     fi
 
     if [ -n "${port}" ]; then
         # 仅删除带有 Brume 注释的规则，避免误删同端口的现有规则
-        local rule_nums
-        rule_nums=$(execute_privileged env LC_ALL=C ufw status numbered 2>/dev/null \
-            | grep -E "^\\[[[:space:]]*[0-9]+\\][[:space:]]+${port}/(tcp|udp)([[:space:]]|$)" \
-            | grep -E '# brume-(whitelist|deny-default)([[:space:]]|$)' \
-            | grep -oP '^\[\s*\K[0-9]+' \
-            | sort -rn)
-        for num in ${rule_nums}; do
-            echo "y" | execute_privileged ufw delete "${num}" 2>/dev/null
-        done
+        status=$(execute_privileged env LC_ALL=C ufw status numbered) || return 1
+        while IFS= read -r line; do
+            if [[ "${line}" =~ ^\[[[:space:]]*([0-9]+)\][[:space:]]+${port}/(tcp|udp)([[:space:]]|$) ]]; then
+                number=${BASH_REMATCH[1]}
+                if [[ "${line}" =~ \#\ brume-(whitelist|deny-default)([[:space:]]|$) ]]; then
+                    matching_rules+=("${number}")
+                fi
+            fi
+        done <<< "${status}"
+        if [ "${#matching_rules[@]}" -gt 0 ]; then
+            rule_nums=$(printf '%s\n' "${matching_rules[@]}" | sort -rn) || return 1
+            for number in ${rule_nums}; do
+                execute_privileged ufw --force delete "${number}" || return 1
+            done
+        fi
     fi
 
     echo -e "${GREEN}ufw 规则已清除${RESET}"
@@ -829,10 +867,17 @@ remove_firewall_ufw() {
 
 # 移除 nftables 规则
 remove_firewall_nftables() {
+    local tables kind family name extra
     echo -e "${CYAN}移除 nftables 防火墙规则...${RESET}"
 
-    # 删除 brume 表
-    execute_privileged nft delete table inet brume 2>/dev/null
+    # 查询失败与不存在不同，只有查询成功且没有目标表时才跳过删除。
+    tables=$(execute_privileged nft list tables) || return 1
+    while read -r kind family name extra; do
+        if [ "${kind}" = table ] && [ "${family}" = inet ] && [ "${name}" = brume ]; then
+            execute_privileged nft delete table inet brume || return 1
+            break
+        fi
+    done <<< "${tables}"
 
     # 更新持久化配置，导出失败时不覆盖原文件
     persist_nftables_rules /etc/nftables.conf || return 1
@@ -842,40 +887,53 @@ remove_firewall_nftables() {
 
 # 移除 iptables 规则
 remove_firewall_iptables() {
-    local port=$1
+    local port=$1 backend rules line chain_exists jump_matches port_matches index
+    local -a arguments
 
     echo -e "${CYAN}移除 iptables 防火墙规则...${RESET}"
 
     if [ -z "${port}" ]; then
-        port=$(get_current_port)
+        port=$(get_current_port) || return 1
     fi
 
-    # 移除 INPUT 链中指向自定义 chain 的引用
-    if [ -n "${port}" ]; then
-        execute_privileged iptables -D INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
-        execute_privileged iptables -D INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
-        if command -v ip6tables &> /dev/null; then
-            execute_privileged ip6tables -D INPUT -p tcp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
-            execute_privileged ip6tables -D INPUT -p udp --dport "${port}" -j "${IPTABLES_CHAIN}" 2>/dev/null
+    for backend in iptables ip6tables; do
+        if [ "${backend}" = ip6tables ] && ! command -v ip6tables >/dev/null; then
+            continue
         fi
-    else
-        # 尝试通过 chain 名称查找并删除所有引用
-        while execute_privileged iptables -D INPUT -j "${IPTABLES_CHAIN}" 2>/dev/null; do :; done
-        if command -v ip6tables &> /dev/null; then
-            while execute_privileged ip6tables -D INPUT -j "${IPTABLES_CHAIN}" 2>/dev/null; do :; done
+        # 一次查询同时确认规则及链是否存在，避免把权限错误当成规则缺失。
+        rules=$(execute_privileged "${backend}" -S) || return 1
+        chain_exists=false
+        while IFS= read -r line; do
+            if [ "${line}" = "-N ${IPTABLES_CHAIN}" ]; then
+                chain_exists=true
+                continue
+            fi
+            read -r -a arguments <<< "${line}"
+            [ "${#arguments[@]}" -ge 2 ] || continue
+            [ "${arguments[0]}" = -A ] && [ "${arguments[1]}" = INPUT ] || continue
+            jump_matches=false port_matches=false
+            [ -n "${port}" ] || port_matches=true
+            for ((index=2; index+1<${#arguments[@]}; index++)); do
+                if [ "${arguments[index]}" = -j ] && [ "${arguments[index+1]}" = "${IPTABLES_CHAIN}" ]; then
+                    jump_matches=true
+                elif [ "${arguments[index]}" = --dport ] && [ "${arguments[index+1]}" = "${port}" ]; then
+                    port_matches=true
+                fi
+            done
+            if [ "${jump_matches}" = true ] && [ "${port_matches}" = true ]; then
+                # 参数只按字面值传递；模糊的自定义规则会明确失败，不执行任何展开。
+                arguments[0]=-D
+                execute_privileged "${backend}" "${arguments[@]}" || return 1
+            fi
+        done <<< "${rules}"
+        if [ "${chain_exists}" = true ]; then
+            execute_privileged "${backend}" -F "${IPTABLES_CHAIN}" || return 1
+            execute_privileged "${backend}" -X "${IPTABLES_CHAIN}" || return 1
         fi
-    fi
-
-    # 清空并删除自定义 chain
-    execute_privileged iptables -F "${IPTABLES_CHAIN}" 2>/dev/null
-    execute_privileged iptables -X "${IPTABLES_CHAIN}" 2>/dev/null
-    if command -v ip6tables &> /dev/null; then
-        execute_privileged ip6tables -F "${IPTABLES_CHAIN}" 2>/dev/null
-        execute_privileged ip6tables -X "${IPTABLES_CHAIN}" 2>/dev/null
-    fi
+    done
 
     # 更新持久化规则
-    persist_iptables_rules
+    persist_iptables_rules || return 1
 
     echo -e "${GREEN}iptables 规则已清除${RESET}"
 }
@@ -985,6 +1043,12 @@ binary_supports_dns() {
     local help
     help=$("$1" --help 2>&1) || return 1
     [[ "${help}" == *--dns-servers* ]]
+}
+
+binary_supports_check_config() {
+    local help
+    help=$("$1" --help 2>&1) || return 1
+    [[ "${help}" == *--check-config* ]]
 }
 
 prepare_binary() {
@@ -1106,41 +1170,213 @@ start_service() {
 # 修改配置函数
 # ============================================================
 
-modify() {
-    local init_system=$1
-    local old_port
-    local old_whitelist
-
-    # 获取旧配置用于清理防火墙规则
-    old_port=$(get_current_port) || return 1
-    old_whitelist=$(get_current_whitelist) || return 1
-
-    if ! binary_supports_config "${INSTALL_DIR}/brume"; then
-        echo -e "${RED}当前程序不支持配置文件，请先更新到包含 --config 功能的版本${RESET}"
+# 事务目录只包含已知文件，避免递归删除不可确认的路径
+cleanup_modify_transaction() {
+    local transaction_dir=$1
+    [ -d "${transaction_dir}" ] || return 0
+    if [ -f "${transaction_dir}/recovery-needed" ]; then
+        echo "恢复未完成，已保留私有备份目录：${transaction_dir}" >&2
         return 1
     fi
-    write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}" || return 1
-
-    # 停止服务
-    stop_service_by_init "${init_system}"
-
-    # 如果之前有白名单配置，先清理旧的防火墙规则
-    if [ -n "${old_whitelist}" ]; then
-        echo "清理旧的防火墙规则..."
-        remove_firewall "${old_port}"
-    fi
-
-    # 更新服务文件
-    create_service "${init_system}"
-
-    # 设置新的防火墙规则
-    setup_firewall "${port}" "${whitelist}"
-
-    # 重启服务
-    restart_service_by_init "${init_system}"
-
-    echo -e "${GREEN}Brume 服务器配置修改完成！${RESET}"
+    rm -f -- "${transaction_dir}/new.conf" "${transaction_dir}/old-effective.conf" \
+        "${transaction_dir}/previous.conf" "${transaction_dir}/previous.service" \
+        "${transaction_dir}/had-config" "${transaction_dir}/installer.sh" \
+        "${transaction_dir}/ready" "${transaction_dir}/go"
+    rmdir -- "${transaction_dir}"
 }
+
+check_service_running() {
+    case "$1" in
+        systemd) execute_privileged systemctl is-active --quiet "${SERVICE_NAME}" ;;
+        openrc) execute_privileged rc-service "${SERVICE_NAME}" status ;;
+        sysvinit) execute_privileged /etc/init.d/"${SERVICE_NAME}" status ;;
+        *) return 1 ;;
+    esac
+}
+
+# 每个恢复阶段单独尝试，单项失败不会阻断其余恢复操作
+rollback_modify_transaction() {
+    local transaction_dir=$1 init_system=$2 service_file=$3
+    local firewall_changed=$4 restart_attempted=$5 new_port=$6 old_port=$7 old_whitelist=$8
+    local failed=false
+    echo "修改配置失败，正在恢复原配置和服务。" >&2
+    if [ -f "${transaction_dir}/had-config" ]; then
+        cp -- "${transaction_dir}/previous.conf" "${CONFIG_FILE}" \
+            || { failed=true; echo "恢复配置文件失败，请手动检查。" >&2; }
+    else
+        rm -f -- "${CONFIG_FILE}" || { failed=true; echo "清理新配置文件失败。" >&2; }
+    fi
+    cp -p -- "${transaction_dir}/previous.service" "${service_file}" \
+        || { failed=true; echo "恢复服务定义失败，请手动检查。" >&2; }
+    if [ "${init_system}" = systemd ]; then
+        execute_privileged systemctl daemon-reload || { failed=true; echo "重新加载原服务定义失败。" >&2; }
+    fi
+    if [ "${firewall_changed}" = true ]; then
+        (
+            trap - EXIT HUP INT TERM
+            local restore_failed=false
+            remove_firewall "${new_port}" || { restore_failed=true; echo "清理候选防火墙规则失败，继续恢复旧规则。" >&2; }
+            setup_firewall "${old_port}" "${old_whitelist}" || restore_failed=true
+            [ "${restore_failed}" = false ]
+        ) || { failed=true; echo "恢复防火墙失败，请手动检查。" >&2; }
+    fi
+    if [ "${restart_attempted}" = true ]; then
+        (
+            trap - EXIT HUP INT TERM
+            restart_service_by_init "${init_system}" || return 1
+            sleep 1
+            check_service_running "${init_system}"
+        ) || { failed=true; echo "恢复原服务失败，请手动检查。" >&2; }
+    fi
+    [ "${failed}" = false ]
+}
+
+# 应用与回滚均由独立进程执行，当前 SSH 断开不影响事务完成
+apply_modify_transaction() (
+    local transaction_dir=$1 init_system=$2 service_file
+    local old_port old_whitelist new_port new_whitelist
+    local firewall_changed=false restart_attempted=false config_changed=false committed=false result preserve_transaction=false
+    trap 'result=$?; trap - EXIT HUP INT TERM;
+        if [ "${committed}" != true ] && [ "${config_changed}" = true ]; then
+            if ! rollback_modify_transaction "${transaction_dir}" "${init_system}" "${service_file}" \
+                "${firewall_changed}" "${restart_attempted}" "${new_port}" "${old_port}" "${old_whitelist}"; then
+                preserve_transaction=true;
+                touch "${transaction_dir}/recovery-needed";
+                echo "恢复未完成，私有备份保留于：${transaction_dir}" >&2;
+            fi;
+            result=1;
+        fi;
+        if [ "${preserve_transaction}" != true ]; then cleanup_modify_transaction "${transaction_dir}" || result=1; fi;
+        exit "${result}"' EXIT
+    trap 'exit 1' HUP INT TERM
+
+    service_file=$(get_service_file "${init_system}") || return 1
+    dns_servers=${DEFAULT_DNS_SERVERS}
+    load_config_file "${transaction_dir}/old-effective.conf" || return 1
+    old_port=${port} old_whitelist=${whitelist}
+    dns_servers=${DEFAULT_DNS_SERVERS}
+    load_config_file "${transaction_dir}/new.conf" || return 1
+    new_port=${port} new_whitelist=${whitelist}
+    config_changed=true
+    write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}" || return 1
+    create_service "${init_system}" || return 1
+    if [ "${old_port}" != "${new_port}" ] || [ "${old_whitelist}" != "${new_whitelist}" ]; then
+        firewall_changed=true
+        if [ -n "${old_whitelist}" ]; then
+            remove_firewall "${old_port}" || return 1
+        fi
+        setup_firewall "${new_port}" "${new_whitelist}" || return 1
+    fi
+    restart_attempted=true
+    restart_service_by_init "${init_system}" || return 1
+    sleep 1
+    check_service_running "${init_system}" || return 1
+    committed=true
+    echo "Brume 配置修改完成，服务已重新启动。"
+)
+
+# 调度进程与工作进程握手后才允许开始应用，失败时不会触碰现有配置
+schedule_independent_worker() {
+    local transaction_dir=$1 init_system=$2 log_file=$3 worker_action=$4 worker_pid attempt
+    require_independent_worker_tools || return 1
+    nohup setsid bash "${transaction_dir}/installer.sh" "${worker_action}" "${transaction_dir}" "${init_system}" "${mutation_lock_fd}" \
+        </dev/null >"${log_file}" 2>&1 &
+    worker_pid=$!
+    for ((attempt=0; attempt<50; attempt++)); do
+        if [ -f "${transaction_dir}/ready" ]; then
+            touch "${transaction_dir}/go" && return 0
+            break
+        fi
+        kill -0 "${worker_pid}" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill "${worker_pid}" 2>/dev/null || true
+    wait "${worker_pid}" 2>/dev/null || true
+    echo "无法启动独立配置工作进程，现有服务保持运行。" >&2
+    return 1
+}
+
+schedule_modify_apply() {
+    schedule_independent_worker "$1" "$2" "$3" --apply-modify
+}
+
+run_independent_worker() {
+    local transaction_dir=$1 init_system=$2 worker_action=$4 prefix attempt
+    mutation_lock_fd=$3
+    case "${worker_action}" in
+        --apply-modify) prefix=.modify. ;;
+        --restart-upgrade) prefix=.upgrade. ;;
+        *) return 1 ;;
+    esac
+    # 工作目录必须是配置目录内由 root 独占的真实目录
+    if [ "$(id -u)" != 0 ] || [[ "${transaction_dir}" != "${CONFIG_DIR}/${prefix}"* ]] \
+        || [ "${transaction_dir%/*}" != "${CONFIG_DIR}" ] \
+        || [ ! -d "${transaction_dir}" ] || [ -L "${transaction_dir}" ] \
+        || [ "$(stat -c '%u:%a' "${transaction_dir}")" != 0:700 ]; then
+        echo "配置事务目录不安全，拒绝应用。" >&2
+        return 1
+    fi
+    validate_mutation_lock || { echo "工作进程没有继承有效事务锁，拒绝应用。" >&2; return 1; }
+    touch "${transaction_dir}/ready" || return 1
+    for ((attempt=0; attempt<100; attempt++)); do
+        if [ -f "${transaction_dir}/go" ]; then
+            if [ "${worker_action}" = --apply-modify ]; then
+                apply_modify_transaction "${transaction_dir}" "${init_system}"
+            else
+                (
+                    trap 'result=$?; cleanup_modify_transaction "${transaction_dir}"; exit "${result}"' EXIT
+                    restart_service_by_init "${init_system}" || return 1
+                    sleep 1
+                    check_service_running "${init_system}" || return 1
+                    echo "升级服务已重启并通过状态检查。"
+                )
+            fi
+            return
+        fi
+        sleep 0.1
+    done
+    cleanup_modify_transaction "${transaction_dir}"
+    echo "配置事务未获调度确认，已取消。" >&2
+    return 1
+}
+
+modify() (
+    local init_system=$1 transaction_dir="" log_file="" service_file scheduled=false
+    local -a new_config=("${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}") old_config
+    acquire_mutation_lock || return 1
+    if ! binary_supports_check_config "${INSTALL_DIR}/brume"; then
+        echo "当前程序不支持完整配置校验，请先升级到包含 --check-config 的版本。" >&2
+        return 1
+    fi
+    require_independent_worker_tools || return 1
+    get_current_config_auto "${init_system}" || return 1
+    old_config=("${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}")
+    service_file=$(get_service_file "${init_system}") || return 1
+    mkdir -p -m 700 "${CONFIG_DIR}" && chmod 700 "${CONFIG_DIR}" || return 1
+    transaction_dir=$(mktemp -d "${CONFIG_DIR}/.modify.XXXXXX") || return 1
+    trap 'if [ "${scheduled}" != true ] && [ ! -f "${transaction_dir}/go" ]; then cleanup_modify_transaction "${transaction_dir}"; fi' EXIT
+    (
+        CONFIG_DIR=${transaction_dir} CONFIG_FILE="${transaction_dir}/new.conf"
+        write_config_file "${new_config[@]}" || return 1
+        CONFIG_FILE="${transaction_dir}/old-effective.conf"
+        write_config_file "${old_config[@]}"
+    ) || return 1
+    if ! "${INSTALL_DIR}/brume" --config "${transaction_dir}/new.conf" --check-config; then
+        echo "候选配置校验失败，现有配置和服务保持运行。" >&2
+        return 1
+    fi
+    cp -p -- "${service_file}" "${transaction_dir}/previous.service" || return 1
+    if [ -f "${CONFIG_FILE}" ]; then
+        cp -p -- "${CONFIG_FILE}" "${transaction_dir}/previous.conf" \
+            && touch "${transaction_dir}/had-config" || return 1
+    fi
+    cp -- "${BASH_SOURCE[0]}" "${transaction_dir}/installer.sh" || return 1
+    log_file=$(mktemp "${CONFIG_DIR}/modify.XXXXXX.log") || return 1
+    schedule_modify_apply "${transaction_dir}" "${init_system}" "${log_file}" || return 1
+    scheduled=true
+    echo "已安排独立进程应用配置；经过 Brume 的 SSH 连接可能短暂断开，请稍后重连。"
+    echo "应用结果日志：${log_file}"
+)
 
 # ============================================================
 # 卸载函数
@@ -1702,8 +1938,10 @@ get_current_config_auto() {
     fi
 }
 
-upgrade() {
+upgrade() (
     local init_system=$1
+    acquire_mutation_lock || return 1
+    require_independent_worker_tools || return 1
     echo -e "${BLUE}=== Brume 服务器一键更新 ===${RESET}"
 
     # 1. 自动提取参数
@@ -1733,7 +1971,7 @@ upgrade() {
     # 7. 端口和白名单未改变，无需重建防火墙规则
     echo -e "${GREEN}新版本已安装，正在安排服务自动重启${RESET}"
     schedule_upgrade_restart "${init_system}"
-}
+)
 
 # ============================================================
 # 主函数
@@ -1843,5 +2081,9 @@ main() {
 
 # 直接运行脚本时进入交互式菜单
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main "$@"
+    if { [ "${1:-}" = --apply-modify ] || [ "${1:-}" = --restart-upgrade ]; } && [ $# -eq 4 ]; then
+        run_independent_worker "$2" "$3" "$4" "$1"
+    else
+        main "$@"
+    fi
 fi

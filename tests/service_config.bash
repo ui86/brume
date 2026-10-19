@@ -76,6 +76,8 @@ done
 # 升级必须把自定义配置与覆盖项完整迁移到标准配置，不能恢复默认值
 printf 'ExecStart=%s/brume "--config=%s" --port=26551\n' "${INSTALL_DIR}" "${actual_config}" > "${test_service_file}"
 check_architecture() { echo amd64; }
+acquire_mutation_lock() { :; }
+require_independent_worker_tools() { :; }
 get_latest_version() { echo 1.0.7; }
 prepare_binary() { :; }
 install_prepared_binary() { :; }

@@ -65,7 +65,14 @@ done
 
 (
     source "${script_dir}/../install.sh"
-    execute_privileged() { printf '%s\n' "$*" >> "${events}"; }
+    execute_privileged() {
+        printf '%s\n' "$*" >> "${events}"
+        if [ "${2:-}" = -S ]; then
+            printf '%s\n' '-N BRUME_WHITELIST' \
+                '-A INPUT -p tcp --dport 26547 -j BRUME_WHITELIST' \
+                '-A INPUT -p udp --dport 26547 -j BRUME_WHITELIST'
+        fi
+    }
     persist_iptables_rules() { :; }
     ip6tables() { :; }
     : > "${events}"
@@ -73,3 +80,14 @@ done
     grep -q 'ip6tables -D INPUT -p udp --dport 26547' "${events}"
     grep -q 'ip6tables -X BRUME_WHITELIST' "${events}"
 )
+
+# 实际防火墙命令失败必须传回事务，不能继续打印配置成功
+for backend in firewalld ufw nftables iptables; do
+    (
+        execute_privileged() { return 1; }
+        if "setup_firewall_${backend}" 26547 192.0.2.1 >/dev/null 2>&1; then
+            echo "${backend} 命令失败被忽略" >&2
+            exit 1
+        fi
+    )
+done
