@@ -15,6 +15,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+mod http_proxy;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_BUFFER_SIZE: usize = 65_535;
 const MAX_TCP_CLIENTS: usize = 2048;
@@ -443,7 +445,18 @@ async fn handle_client(
 ) -> io::Result<()> {
     // 协商及转发小报文时避免 Nagle 引入额外等待
     stream.set_nodelay(true)?;
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiate(&mut stream, &config))
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let mut first = [0];
+    let received = tokio::time::timeout_at(deadline, stream.peek(&mut first))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "读取代理协议超时"))??;
+    if received == 0 {
+        return Ok(());
+    }
+    if first[0] != 5 {
+        return http_proxy::serve(stream, &config, &dns).await;
+    }
+    tokio::time::timeout_at(deadline, negotiate(&mut stream, &config))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 协商超时"))??;
 
@@ -502,7 +515,7 @@ async fn connect(
         remote.set_nodelay(true)?;
 
         protocol::write_reply_async(&mut client, protocol::SUCCESS, remote.local_addr()?).await?;
-        forward_bidirectional(&mut client, &mut remote, timeout).await
+        forward_bidirectional(client.split(), &mut remote, timeout).await
     };
 
     tokio::select! {
@@ -511,49 +524,56 @@ async fn connect(
     }
 }
 
-async fn forward_bidirectional(
-    client: &mut tokio::net::TcpStream,
+async fn forward_bidirectional<R, W>(
+    (mut client_r, mut client_w): (R, W),
     remote: &mut tokio::net::TcpStream,
     timeout: Option<Duration>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let (mut remote_r, mut remote_w) = remote.split();
     match timeout {
-        None => {
-            let (mut client_r, mut client_w) = client.split();
-            let (mut remote_r, mut remote_w) = remote.split();
-            tokio::try_join!(
-                copy_direction(&mut client_r, &mut remote_w, None),
-                copy_direction(&mut remote_r, &mut client_w, None),
-            )
-            .map(|_| ())
-        }
+        None => tokio::try_join!(
+            copy_direction(&mut client_r, &mut remote_w, None),
+            copy_direction(&mut remote_r, &mut client_w, None),
+        )
+        .map(|_| ()),
         Some(idle_timeout) => {
-            let (mut client_r, mut client_w) = client.split();
-            let (mut remote_r, mut remote_w) = remote.split();
-            let (activity, mut activity_rx) = watch::channel(tokio::time::Instant::now());
+            let (activity, activity_rx) = watch::channel(tokio::time::Instant::now());
             let c2r = copy_direction(&mut client_r, &mut remote_w, Some(&activity));
             let r2c = copy_direction(&mut remote_r, &mut client_w, Some(&activity));
             let transfer = async { tokio::try_join!(c2r, r2c).map(|_| ()) };
-            tokio::pin!(transfer);
+            with_tcp_idle_timeout(transfer, activity_rx, idle_timeout).await
+        }
+    }
+}
 
-            loop {
-                let deadline = activity_rx
-                    .borrow_and_update()
-                    .checked_add(idle_timeout)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "TCP 超时超出系统时钟范围")
-                    })?;
-                tokio::select! {
-                    result = &mut transfer => return result,
-                    _ = tokio::time::sleep_until(deadline) => {
-                        if tokio::time::Instant::now().duration_since(*activity_rx.borrow()) >= idle_timeout {
-                            return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP 连接空闲超时"));
-                        }
-                    }
-                    changed = activity_rx.changed() => {
-                        if changed.is_err() {
-                            return Err(io::Error::other("TCP 转发任务已停止"));
-                        }
-                    }
+async fn with_tcp_idle_timeout(
+    transfer: impl Future<Output = io::Result<()>>,
+    mut activity: watch::Receiver<tokio::time::Instant>,
+    idle_timeout: Duration,
+) -> io::Result<()> {
+    tokio::pin!(transfer);
+    loop {
+        let deadline = activity
+            .borrow_and_update()
+            .checked_add(idle_timeout)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "TCP 超时超出系统时钟范围")
+            })?;
+        tokio::select! {
+            result = &mut transfer => return result,
+            _ = tokio::time::sleep_until(deadline) => {
+                if tokio::time::Instant::now().duration_since(*activity.borrow()) >= idle_timeout {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP 连接空闲超时"));
+                }
+            }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    // 连接对象已释放，此时转发已完成或将返回错误。
+                    return transfer.await;
                 }
             }
         }
@@ -1053,7 +1073,7 @@ async fn receive_udp_payload(
 mod tests {
     use super::*;
     use crate::config::Whitelist;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
     use std::sync::mpsc;
     use std::thread;
@@ -1726,6 +1746,115 @@ mod tests {
         client.read_to_end(&mut response).unwrap();
         assert_eq!(response, b"brume");
         echo_thread.join().unwrap();
+        shutdown.cancel();
+        server_thread.join().unwrap().unwrap();
+    }
+
+    fn read_http_head(reader: &mut impl BufRead) -> String {
+        let mut head = String::new();
+        loop {
+            let start = head.len();
+            assert_ne!(reader.read_line(&mut head).unwrap(), 0);
+            if &head[start..] == "\r\n" {
+                return head;
+            }
+        }
+    }
+
+    #[test]
+    fn http_connect_and_socks5_share_the_same_tcp_port() {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = origin.local_addr().unwrap();
+        let echo = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).unwrap();
+            stream.write_all(&payload).unwrap();
+        });
+        let (proxy, shutdown, server_thread) = start_server("admin", "secret", "127.0.0.1");
+        let mut socks = TcpStream::connect(proxy).unwrap();
+        socks
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(negotiate_client(&mut socks, 2), [5, 2]);
+
+        let http = TcpStream::connect(proxy).unwrap();
+        http.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut http = BufReader::new(http);
+        write!(
+            http.get_mut(),
+            "CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\n"
+        )
+        .unwrap();
+        let head = read_http_head(&mut http).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 407 "));
+        assert!(head.contains("proxy-authenticate: basic"));
+
+        write!(
+            http.get_mut(),
+            "CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\nProxy-Authorization: Basic YWRtaW46c2VjcmV0\r\n\r\nprefetched tunnel bytes"
+        )
+        .unwrap();
+        let head = read_http_head(&mut http).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200 "));
+        assert!(!head.contains("content-length:"));
+        assert!(!head.contains("transfer-encoding:"));
+        http.get_mut().shutdown(Shutdown::Write).unwrap();
+        let mut payload = Vec::new();
+        http.read_to_end(&mut payload).unwrap();
+        assert_eq!(payload, b"prefetched tunnel bytes");
+        echo.join().unwrap();
+        shutdown.cancel();
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn http_proxy_forwards_body_and_rewrites_headers() {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = origin.local_addr().unwrap();
+        let origin_thread = thread::spawn(move || {
+            let (stream, _) = origin.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let head = read_http_head(&mut stream).to_ascii_lowercase();
+            assert!(head.starts_with("post /submit?key=value http/1.1\r\n"));
+            assert!(head.contains(&format!("host: {destination}\r\n")));
+            assert!(!head.contains("proxy-authorization"));
+            assert!(!head.contains("x-request-hop:"));
+            assert!(!head.contains("expect:"));
+            let mut payload = [0; 5];
+            stream.read_exact(&mut payload).unwrap();
+            assert_eq!(&payload, b"brume");
+            stream
+                .get_mut()
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close, X-Response-Hop\r\nX-Response-Hop: remove\r\n\r\n5\r\nbrume\r\n0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let (proxy, shutdown, server_thread) = start_server("admin", "secret", "127.0.0.1");
+        let client = TcpStream::connect(proxy).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut client = BufReader::new(client);
+        write!(
+            client.get_mut(),
+            "POST http://{destination}/submit?key=value HTTP/1.1\r\nHost: ignored.example\r\nProxy-Authorization: Basic YWRtaW46c2VjcmV0\r\nConnection: close, X-Request-Hop\r\nX-Request-Hop: remove\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
+        )
+        .unwrap();
+        assert!(read_http_head(&mut client).starts_with("HTTP/1.1 100 "));
+        client.get_mut().write_all(b"brume").unwrap();
+        let head = read_http_head(&mut client).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200 "));
+        assert!(!head.contains("x-response-hop:"));
+        assert!(head.contains("transfer-encoding: chunked"));
+        let mut payload = Vec::new();
+        client.read_to_end(&mut payload).unwrap();
+        assert_eq!(payload, b"5\r\nbrume\r\n0\r\n\r\n");
+        origin_thread.join().unwrap();
         shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }

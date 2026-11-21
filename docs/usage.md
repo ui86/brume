@@ -3,6 +3,7 @@
 ## 功能
 
 - SOCKS5 无认证与用户名密码认证（RFC 1929）
+- 同端口 HTTP/1.0 和 HTTP/1.1 正向代理，支持普通 HTTP 请求及 HTTPS CONNECT
 - IPv4、IPv6 和域名目标地址
 - TCP 双向转发及半关闭
 - UDP 关联转发；仅接受存活的 TCP 关联对应的 UDP 数据报
@@ -21,6 +22,16 @@ cargo build --release --locked
 ```
 
 上述命令使用默认端口 `1080`，仅允许本机客户端连接。服务端在同一端口监听 TCP 和 UDP，使用 Ctrl+C 停止。
+
+同一个端口可分别配置为 HTTP 代理或 SOCKS5 代理。例如：
+
+```bash
+curl --proxy http://127.0.0.1:1080 http://example.com/
+curl --proxy http://127.0.0.1:1080 https://example.com/
+curl --proxy socks5h://127.0.0.1:1080 https://example.com/
+```
+
+HTTP 客户端与 SOCKS5 共用白名单和账号密码。配置了认证时，HTTP 客户端使用 Basic 代理认证，例如向 curl 添加 `--proxy-user 'admin:密码'`。Basic 认证要求用户名中不含冒号。代理连接本身使用明文 TCP，HTTPS 目标通过 CONNECT 保持端到端 TLS。普通 HTTP 转发支持有请求体的请求，协议升级需通过 CONNECT 隧道。设置 `tcp_timeout` 后，HTTP 连接也会在双向无流量时关闭。
 
 Linux amd64 和 arm64 可运行交互式安装脚本。脚本从 GitHub Release 下载 `brume-版本-linux-架构.tar.gz`，提供安装、更新、修改配置和卸载选项，并为同一端口的 TCP、UDP 及 IPv4、IPv6 配置可用的防火墙。运行脚本需要 root 或 sudo 权限：
 

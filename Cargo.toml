@@ -2,12 +2,16 @@
 name = "brume"
 version = "1.0.8"
 edition = "2024"
-description = "轻量级 SOCKS5 代理服务器"
+description = "轻量级 SOCKS5 和 HTTP 代理服务器"
 
 [dependencies]
+base64 = "0.22"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "system-config"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 socket2 = "0.6.5"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
