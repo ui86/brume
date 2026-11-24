@@ -55,6 +55,6 @@ jobs:
             bash /repo/tests/linux_container.bash debian
           '
           docker run --rm --cap-drop NET_ADMIN --tmpfs /tmp:rw,noexec -v "$PWD:/repo:ro" alpine:3.23 sh -ec '
-            apk add --no-cache bash openrc nftables iptables util-linux
+            apk add --no-cache bash openrc nftables iptables flock
             bash /repo/tests/linux_container.bash alpine
           '

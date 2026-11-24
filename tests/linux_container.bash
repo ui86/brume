@@ -22,8 +22,10 @@ CONFIG_FILE="${CONFIG_DIR}/brume.conf"
 # 即使容器内安装了 sudo，已经是 root 的安装脚本也不需要它。
 has_sudo=true
 sudo() { echo 'root 安装不应调用 sudo' >&2; return 1; }
-[[ "$(detect_init_system)" == standalone ]]
-[[ "$(detect_firewall)" == none ]]
+init_system=$(detect_init_system)
+firewall=$(detect_firewall)
+printf '容器检测结果：服务管理器 %s，防火墙 %s\n' "${init_system}" "${firewall}"
+[[ "${init_system}" == standalone && "${firewall}" == none ]]
 
 cat > "${test_dir}/brume" <<'EOF'
 #!/bin/bash

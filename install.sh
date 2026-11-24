@@ -158,7 +158,7 @@ show_help() {
 
 # 检测正在运行的服务管理器；容器里存在管理命令不代表初始化系统已启动。
 detect_init_system() {
-    local pid1="" manager_version runlevel
+    local pid1="" manager_version
     if [ -r /proc/1/comm ]; then
         IFS= read -r pid1 < /proc/1/comm || true
     fi
@@ -167,9 +167,9 @@ detect_init_system() {
         && manager_version=$(execute_privileged systemctl show --property=Version 2>/dev/null) \
         && [[ "${manager_version}" == Version=?* ]]; then
         echo "systemd"
+    # 旧版 rc-status 在 OpenRC 未启动时也会报告 sysinit，以实际启动标记为准。
     elif command -v rc-service >/dev/null && command -v rc-update >/dev/null \
-        && command -v rc-status >/dev/null \
-        && runlevel=$(execute_privileged rc-status --runlevel 2>/dev/null) && [ -n "${runlevel}" ]; then
+        && { [ -e /run/openrc/softlevel ] || [ -e /lib/rc/init.d/softlevel ]; }; then
         echo "openrc"
     elif [[ "${pid1}" == init || "${pid1}" == sysvinit ]] && [ -d /etc/init.d ] \
         && command -v runlevel >/dev/null && runlevel >/dev/null 2>&1; then
