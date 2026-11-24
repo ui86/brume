@@ -1,0 +1,126 @@
+name: Publish Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag (leave blank for the latest stable release)
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      tag:
+        description: Published release tag
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build and Publish Multi-Platform Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: publish-container-image
+      queue: max
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download Published Binaries
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          latest_tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name) || latest_tag=
+          tag="${REQUESTED_TAG:-$latest_tag}"
+          if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ || "$tag" == latest ]]; then
+            echo "Expected a published release tag that is valid as a Docker tag." >&2
+            exit 1
+          fi
+          is_draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          if [[ "$is_draft" != false ]]; then
+            echo "Release $tag has not been published." >&2
+            exit 1
+          fi
+
+          mkdir -p docker/archives
+          for arch in amd64 arm64; do
+            asset="brume-$tag-linux-$arch.tar.gz"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir docker/archives
+            mv "docker/archives/$asset" "docker/archives/brume-linux-$arch.tar.gz"
+          done
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          {
+            echo "image=$image"
+            echo "version=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set Up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Validate Both Images
+        run: |
+          for arch in amd64 arm64; do
+            platform="linux/$arch"
+            image="brume:test-$arch"
+            docker buildx build --platform "$platform" --tag "$image" --load docker
+            docker run --rm --platform "$platform" --network none \
+              -e BRUME_PORT=18080 -e BRUME_USERNAME=ci -e 'BRUME_PASSWORD=pass #= value' \
+              -e BRUME_WHITELIST=127.0.0.1/32,::1/128 \
+              -e BRUME_TCP_TIMEOUT=10 -e BRUME_UDP_TIMEOUT=45 \
+              "$image" --check-config
+            if docker run --rm --platform "$platform" --network none \
+                -e BRUME_PORT=65536 "$image" --check-config; then
+              echo "The $platform image accepted an invalid port." >&2
+              exit 1
+            fi
+          done
+
+      - name: Log In to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish Versioned Image
+        id: publish
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+
+      - name: Verify Manifest and Update Latest Tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION: ${{ steps.release.outputs.version }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" | jq -e '
+            [.manifests[].platform | select(.os == "linux") | .architecture]
+            | sort == ["amd64", "arm64"]
+          ' >/dev/null
+          latest_tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name) || latest_tag=
+          if [[ "$VERSION" == "$latest_tag" ]]; then
+            docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+          fi
+          echo "Published `$IMAGE:$VERSION` for linux/amd64 and linux/arm64." >> "$GITHUB_STEP_SUMMARY"

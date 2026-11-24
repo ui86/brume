@@ -2,7 +2,7 @@ name: Release Rust Binaries
 
 on:
   release:
-    types: [created]
+    types: [published]
 
 permissions:
   contents: write
@@ -20,6 +20,8 @@ jobs:
             target: aarch64-unknown-linux-musl
             arch: arm64
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -44,11 +46,20 @@ jobs:
           "$binary" --help | grep -F -- --dns-servers
       - name: Package release asset
         run: |
-          tar -czf "brume-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" brume -C "$GITHUB_WORKSPACE" README.md docs
+          tar -czf "brume-${RELEASE_TAG}-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" brume -C "$GITHUB_WORKSPACE" README.md docs
       - name: Upload release asset
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "brume-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz" --clobber
+        run: gh release upload "$RELEASE_TAG" "brume-${RELEASE_TAG}-linux-${{ matrix.arch }}.tar.gz" --clobber
+  publish-docker:
+    name: Publish Docker Image
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yaml
+    with:
+      tag: ${{ github.event.release.tag_name }}
   clean-old-workflows:
     name: Clean Old Workflows and Releases
     needs: release

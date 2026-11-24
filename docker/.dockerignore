@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!entrypoint.sh
+!archives/
+!archives/brume-linux-amd64.tar.gz
+!archives/brume-linux-arm64.tar.gz
