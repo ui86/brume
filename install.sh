@@ -3,7 +3,7 @@
 # Brume 服务器安装脚本
 # 支持 linux/amd64 和 linux/arm64 架构
 # 功能：安装、卸载、修改配置
-# 自动适配服务管理器：systemd / OpenRC / SysVinit
+# 自动适配服务管理器：systemd / OpenRC / SysVinit，或安装为前台程序
 # 自动适配防火墙：firewalld / ufw / nftables / iptables
 
 # 默认参数
@@ -35,7 +35,7 @@ execute_privileged() (
     if [ -n "${mutation_lock_fd:-}" ]; then
         exec {mutation_lock_fd}>&-
     fi
-    if [ "$has_sudo" = true ]; then
+    if [ "${EUID}" -ne 0 ] && [ "$has_sudo" = true ]; then
         sudo "$@"
     else
         "$@"
@@ -144,6 +144,7 @@ show_help() {
     echo "  3. 修改Brume服务器配置"
     echo ""
     echo "支持的服务管理器: systemd / OpenRC / SysVinit"
+    echo "没有运行服务管理器时，安装为由容器或外部管理器启动的前台程序"
     echo "支持的防火墙: firewalld / ufw / nftables / iptables"
     echo "服务配置文件: ${CONFIG_FILE}"
     echo ""
@@ -155,17 +156,26 @@ show_help() {
 # 服务管理器检测与适配
 # ============================================================
 
-# 检测可用的服务管理器类型
-# 返回: systemd / openrc / sysvinit
+# 检测正在运行的服务管理器；容器里存在管理命令不代表初始化系统已启动。
 detect_init_system() {
-    if command -v systemctl &> /dev/null && systemctl --version &> /dev/null; then
+    local pid1="" manager_version runlevel
+    if [ -r /proc/1/comm ]; then
+        IFS= read -r pid1 < /proc/1/comm || true
+    fi
+
+    if [[ "${pid1}" == systemd || "${pid1}" == init ]] && command -v systemctl >/dev/null \
+        && manager_version=$(execute_privileged systemctl show --property=Version 2>/dev/null) \
+        && [[ "${manager_version}" == Version=?* ]]; then
         echo "systemd"
-    elif command -v rc-service &> /dev/null; then
+    elif command -v rc-service >/dev/null && command -v rc-update >/dev/null \
+        && command -v rc-status >/dev/null \
+        && runlevel=$(execute_privileged rc-status --runlevel 2>/dev/null) && [ -n "${runlevel}" ]; then
         echo "openrc"
-    elif command -v service &> /dev/null || [ -d /etc/init.d ]; then
+    elif [[ "${pid1}" == init || "${pid1}" == sysvinit ]] && [ -d /etc/init.d ] \
+        && command -v runlevel >/dev/null && runlevel >/dev/null 2>&1; then
         echo "sysvinit"
     else
-        echo "unknown"
+        echo "standalone"
     fi
 }
 
@@ -561,9 +571,10 @@ detect_firewall() {
         echo "firewalld"
     elif is_ufw_active; then
         echo "ufw"
-    elif command -v nft &> /dev/null; then
+    elif command -v nft >/dev/null && execute_privileged nft list tables &>/dev/null; then
         echo "nftables"
-    elif command -v iptables &> /dev/null; then
+    elif command -v iptables >/dev/null && execute_privileged iptables -S &>/dev/null \
+        && { ! command -v ip6tables >/dev/null || execute_privileged ip6tables -S &>/dev/null; }; then
         echo "iptables"
     else
         echo "none"
@@ -971,9 +982,7 @@ setup_firewall() {
             setup_firewall_iptables "${port}" "${whitelist}"
             ;;
         none)
-            echo -e "${YELLOW}未检测到可用的防火墙工具${RESET}"
-            echo -e "${YELLOW}建议安装 iptables 或 ufw 以增强安全性${RESET}"
-            echo -e "${YELLOW}IP白名单已通过 Brume 应用层生效，但未进行网络层限制${RESET}"
+            echo -e "${YELLOW}当前环境无法配置系统防火墙，IP 白名单由 Brume 执行。${RESET}"
             ;;
     esac
 }
@@ -1032,19 +1041,6 @@ get_latest_version() {
     echo "$latest_version"
 }
 
-# 下载并检查二进制文件，暂不替换正在运行的程序
-binary_supports_config() {
-    local help
-    help=$("$1" --help 2>&1) || return 1
-    [[ "${help}" == *--config* ]]
-}
-
-binary_supports_dns() {
-    local help
-    help=$("$1" --help 2>&1) || return 1
-    [[ "${help}" == *--dns-servers* ]]
-}
-
 binary_supports_check_config() {
     local help
     help=$("$1" --help 2>&1) || return 1
@@ -1054,7 +1050,10 @@ binary_supports_check_config() {
 prepare_binary() {
     local version=$1
     local arch=$2
-    prepared_dir=$(mktemp -d) || exit 1
+    local help
+    # 精简镜像可能缺少安装目录，容器的 /tmp 也可能挂载为 noexec。
+    execute_privileged mkdir -p "${INSTALL_DIR}" || return 1
+    prepared_dir=$(mktemp -d "${INSTALL_DIR}/.brume-download.XXXXXX") || return 1
     local download_url="https://github.com/${GITHUB_REPO}/releases/download/${version}/brume-${version}-linux-${arch}.tar.gz"
     local tar_file="${prepared_dir}/brume-${version}-linux-${arch}.tar.gz"
 
@@ -1062,29 +1061,34 @@ prepare_binary() {
     if ! curl -fL -o "${tar_file}" "${download_url}"; then
         echo -e "${RED}下载失败，请检查网络连接或版本是否存在${RESET}"
         rm -rf "${prepared_dir}"
-        exit 1
+        return 1
     fi
 
     echo "解压安装包..."
     if ! tar -xzf "${tar_file}" -C "${prepared_dir}"; then
         echo -e "${RED}解压失败${RESET}"
         rm -rf "${prepared_dir}"
-        exit 1
+        return 1
     fi
 
+    if ! help=$("${prepared_dir}/brume" --help 2>&1); then
+        echo -e "${RED}下载的 Brume 程序无法执行：${help}${RESET}" >&2
+        rm -rf "${prepared_dir}"
+        return 1
+    fi
     # 拒绝不支持配置文件的旧版程序，避免回退到命令行传递密码
-    if ! binary_supports_config "${prepared_dir}/brume"; then
+    if [[ "${help}" != *--config* ]]; then
         echo -e "${RED}该版本不支持配置文件，请选择包含 --config 功能的新版本${RESET}"
         rm -rf "${prepared_dir}"
-        exit 1
+        return 1
     fi
 
     # 当前配置显式使用自定义 DNS 时，拒绝安装不兼容的旧版本
     if [ "${dns_servers:-${DEFAULT_DNS_SERVERS}}" != "${DEFAULT_DNS_SERVERS}" ] \
-        && ! binary_supports_dns "${prepared_dir}/brume"; then
+        && [[ "${help}" != *--dns-servers* ]]; then
         echo -e "${RED}该版本不支持 dns_servers，请选择包含 --dns-servers 功能的新版本${RESET}"
         rm -rf "${prepared_dir}"
-        exit 1
+        return 1
     fi
 }
 
@@ -1092,14 +1096,14 @@ prepare_binary() {
 install_prepared_binary() {
     local staged_binary
     echo "安装到 ${INSTALL_DIR}..."
-    staged_binary=$(mktemp "${INSTALL_DIR}/.brume.XXXXXX") || return 1
+    staged_binary=$(mktemp "${INSTALL_DIR}/.brume.XXXXXX") || { rm -rf "${prepared_dir}"; return 1; }
     if ! execute_privileged cp "${prepared_dir}/brume" "${staged_binary}" \
         || ! execute_privileged chmod 755 "${staged_binary}" \
         || ! execute_privileged mv -f "${staged_binary}" "${INSTALL_DIR}/brume"; then
         echo -e "${RED}安装失败，请检查权限${RESET}"
         rm -f "${staged_binary}"
         rm -rf "${prepared_dir}"
-        exit 1
+        return 1
     fi
 
     rm -rf "${prepared_dir}"
@@ -1108,7 +1112,7 @@ install_prepared_binary() {
 }
 
 download_and_install() {
-    prepare_binary "$1" "$2"
+    prepare_binary "$1" "$2" || return 1
     install_prepared_binary
 }
 
@@ -1119,13 +1123,6 @@ get_current_port() {
     echo "${port}"
 }
 
-# 从当前服务配置中获取白名单
-get_current_whitelist() {
-    local port user password whitelist tcp_timeout udp_timeout uses_config_file
-    get_current_config_auto "$(detect_init_system)" || return 1
-    echo "${whitelist}"
-}
-
 # ============================================================
 # 启动服务（安装后展示信息）
 # ============================================================
@@ -1133,7 +1130,11 @@ get_current_whitelist() {
 start_service() {
     local init_system=$1
 
-    start_service_by_init "${init_system}"
+    if [ "${init_system}" != standalone ]; then
+        start_service_by_init "${init_system}" || return 1
+    elif binary_supports_check_config "${INSTALL_DIR}/brume"; then
+        "${INSTALL_DIR}/brume" --config "${CONFIG_FILE}" --check-config || return 1
+    fi
 
     echo -e "${BLUE}Brume 服务器安装完成！${RESET}"
     echo "配置信息:"
@@ -1141,7 +1142,11 @@ start_service() {
     echo "  认证: $(if [ -n "${user}" ] && [ -n "${password}" ]; then echo "启用"; else echo "禁用"; fi)"
     echo "  白名单: $(if [ -n "${whitelist}" ]; then echo "${whitelist}"; else echo "无（允许所有IP）"; fi)"
     echo "  服务管理器: ${init_system}"
-    echo "  防火墙: $(detect_firewall)"
+    if [ "${init_system}" = standalone ]; then
+        echo "  防火墙: 由容器或宿主管理"
+    else
+        echo "  防火墙: $(detect_firewall)"
+    fi
     echo "  配置文件: ${CONFIG_FILE}"
 
     echo -e "${YELLOW}管理命令:${RESET}"
@@ -1162,6 +1167,9 @@ start_service() {
             echo "  查看服务状态: /etc/init.d/${SERVICE_NAME} status"
             echo "  停止服务: /etc/init.d/${SERVICE_NAME} stop"
             echo "  重启服务: /etc/init.d/${SERVICE_NAME} restart"
+            ;;
+        standalone)
+            echo "  前台启动（可用作容器启动命令）: exec ${INSTALL_DIR}/brume --config ${CONFIG_FILE}"
             ;;
     esac
 }
@@ -1348,22 +1356,31 @@ modify() (
         echo "当前程序不支持完整配置校验，请先升级到包含 --check-config 的版本。" >&2
         return 1
     fi
-    require_independent_worker_tools || return 1
     get_current_config_auto "${init_system}" || return 1
-    old_config=("${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}")
-    service_file=$(get_service_file "${init_system}") || return 1
+    if [ "${init_system}" != standalone ]; then
+        require_independent_worker_tools || return 1
+        old_config=("${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}")
+        service_file=$(get_service_file "${init_system}") || return 1
+    fi
     mkdir -p -m 700 "${CONFIG_DIR}" && chmod 700 "${CONFIG_DIR}" || return 1
     transaction_dir=$(mktemp -d "${CONFIG_DIR}/.modify.XXXXXX") || return 1
     trap 'if [ "${scheduled}" != true ] && [ ! -f "${transaction_dir}/go" ]; then cleanup_modify_transaction "${transaction_dir}"; fi' EXIT
     (
         CONFIG_DIR=${transaction_dir} CONFIG_FILE="${transaction_dir}/new.conf"
         write_config_file "${new_config[@]}" || return 1
-        CONFIG_FILE="${transaction_dir}/old-effective.conf"
-        write_config_file "${old_config[@]}"
+        if [ "${init_system}" != standalone ]; then
+            CONFIG_FILE="${transaction_dir}/old-effective.conf"
+            write_config_file "${old_config[@]}"
+        fi
     ) || return 1
     if ! "${INSTALL_DIR}/brume" --config "${transaction_dir}/new.conf" --check-config; then
-        echo "候选配置校验失败，现有配置和服务保持运行。" >&2
+        echo "候选配置校验失败，保留原配置。" >&2
         return 1
+    fi
+    if [ "${init_system}" = standalone ]; then
+        mv -f -- "${transaction_dir}/new.conf" "${CONFIG_FILE}" || return 1
+        echo "Brume 配置已保存，请通过容器或进程管理器重启后生效。"
+        return 0
     fi
     cp -p -- "${service_file}" "${transaction_dir}/previous.service" || return 1
     if [ -f "${CONFIG_FILE}" ]; then
@@ -1385,26 +1402,15 @@ modify() (
 uninstall() {
     local init_system=$1
     local current_port
-    local current_whitelist
 
     echo -e "${BLUE}=== Brume 服务器卸载 ===${RESET}"
 
-    # 获取当前配置用于清理
-    current_port=$(get_current_port) || return 1
-    current_whitelist=$(get_current_whitelist) || return 1
-
-    # 停止服务
-    stop_service_by_init "${init_system}"
-
-    # 移除服务
-    remove_service_by_init "${init_system}"
-
-    # 清理防火墙规则
-    if [ -n "${current_whitelist}" ]; then
-        echo "正在清理防火墙规则..."
-        remove_firewall "${current_port}"
+    if [ "${init_system}" = standalone ]; then
+        echo "若 Brume 仍在运行，请通过容器或进程管理器停止。"
     else
-        # 即使没有白名单配置，也尝试清理可能残留的规则
+        current_port=$(get_current_port) || return 1
+        stop_service_by_init "${init_system}"
+        remove_service_by_init "${init_system}"
         echo "正在检查并清理防火墙规则..."
         remove_firewall "${current_port}"
     fi
@@ -1439,7 +1445,10 @@ get_action() {
         echo "4. 一键更新Brume服务器"
         echo "5. 显示帮助信息"
 
-        read -p "请输入选项 (1-5): " choice
+        if ! read -r -p "请输入选项 (1-5): " choice; then
+            echo "未收到操作选项，请通过终端或标准输入提供菜单选项。" >&2
+            return 1
+        fi
 
         case $choice in
             1)
@@ -1484,7 +1493,7 @@ get_install_config() {
 
     # 获取端口号
     while true; do
-        read -p "请输入Brume服务器端口号 [默认: ${DEFAULT_PORT}]: " input_port
+        read -r -p "请输入Brume服务器端口号 [默认: ${DEFAULT_PORT}]: " input_port || return 1
         if [ -z "${input_port}" ]; then
             candidate_port=${DEFAULT_PORT}
         elif [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
@@ -1502,21 +1511,20 @@ get_install_config() {
 
     # 获取是否启用认证
     while true; do
-        read -p "是否启用用户认证? (y/n) [默认: n]: " enable_auth
+        read -r -p "是否启用用户认证? (y/n) [默认: n]: " enable_auth || return 1
         enable_auth=${enable_auth:-n}
 
         case ${enable_auth} in
             [Yy])
-                read -p "请输入用户名: " user
+                read -r -p "请输入用户名: " user || return 1
                 while [ -z "${user}" ]; do
-                    read -p "用户名不能为空，请重新输入: " user
+                    read -r -p "用户名不能为空，请重新输入: " user || return 1
                 done
 
-                # shellcheck disable=SC2162
-                read -s -p "请输入密码: " password
+                read -rs -p "请输入密码: " password || return 1
                 echo
                 while [ -z "${password}" ]; do
-                    read -s -p "密码不能为空，请重新输入: " password
+                    read -rs -p "密码不能为空，请重新输入: " password || return 1
                     echo
                 done
                 break
@@ -1533,11 +1541,11 @@ get_install_config() {
     done
 
     # 获取IP白名单
-    echo -e "${YELLOW}提示: 设置IP白名单后，脚本将自动配置防火墙规则，仅允许白名单IP访问服务端口${RESET}"
-    read -p "请输入IP白名单（多个IP用逗号分隔，留空表示不限制）: " whitelist
+    echo -e "${YELLOW}提示: Brume 按白名单限制连接来源，有可用的防火墙时也可应用网络层规则。${RESET}"
+    read -r -p "请输入IP白名单（多个IP用逗号分隔，留空表示不限制）: " whitelist || return 1
 
     # 获取版本信息
-    read -p "请输入要安装的版本（留空表示最新版本）: " version
+    read -r -p "请输入要安装的版本（留空表示最新版本）: " version || return 1
 
     # 显示确认信息
     echo -e "${GREEN}安装配置确认：${RESET}"
@@ -1545,12 +1553,8 @@ get_install_config() {
     echo "认证: $(if [ -n "${user}" ] && [ -n "${password}" ]; then echo "启用 (用户名: ${user})"; else echo "禁用"; fi)"
     echo "白名单: $(if [ -n "${whitelist}" ]; then echo "${whitelist}"; else echo "无（允许所有IP）"; fi)"
     echo "版本: $(if [ -n "${version}" ]; then echo "${version}"; else echo "最新版本"; fi)"
-    if [ -n "${whitelist}" ]; then
-        echo -e "防火墙: ${CYAN}将自动配置防火墙规则${RESET}"
-    fi
-
     while true; do
-        read -p "确认以上配置是否正确? (y/n) [默认: y]: " confirm
+        read -r -p "确认以上配置是否正确? (y/n) [默认: y]: " confirm || return 1
         confirm=${confirm:-y}
 
         case ${confirm} in
@@ -1560,7 +1564,7 @@ get_install_config() {
             [Nn])
                 echo -e "${YELLOW}配置已取消，将重新开始${RESET}"
                 get_install_config
-                break
+                return
                 ;;
             *)
                 echo -e "${RED}无效的选项，请输入y或n${RESET}"
@@ -1572,24 +1576,7 @@ get_install_config() {
 # 交互式获取修改配置参数
 get_modify_config() {
     local init_system=$1
-    local service_file
     local candidate_port
-
-    # 根据 init 系统确定服务文件位置
-    case "${init_system}" in
-        systemd)
-            service_file="/etc/systemd/system/${SERVICE_NAME}.service"
-            ;;
-        openrc|sysvinit)
-            service_file="/etc/init.d/${SERVICE_NAME}"
-            ;;
-    esac
-
-    # 检查服务是否存在
-    if [ ! -f "${service_file}" ]; then
-        echo -e "${RED}Brume 服务未安装，请先安装服务${RESET}"
-        exit 1
-    fi
 
     # 同时兼容旧服务参数与当前配置文件
     get_current_config_auto "${init_system}" || exit 1
@@ -1605,7 +1592,7 @@ get_modify_config() {
 
     # 获取端口号
     while true; do
-        read -p "请输入Brume服务器端口号 [当前: ${port}]: " input_port
+        read -r -p "请输入Brume服务器端口号 [当前: ${port}]: " input_port || return 1
         if [ -z "${input_port}" ]; then
             candidate_port=${port}
         elif [[ "${input_port}" =~ ^[0-9]+$ ]] && [ "${input_port}" -ge 1 ] && [ "${input_port}" -le 65535 ]; then
@@ -1623,24 +1610,24 @@ get_modify_config() {
 
     # 获取是否修改用户认证
     while true; do
-        read -p "是否修改用户认证设置? (y/n) [默认: n]: " change_auth
+        read -r -p "是否修改用户认证设置? (y/n) [默认: n]: " change_auth || return 1
         change_auth=${change_auth:-n}
 
         case ${change_auth} in
             [Yy])
                 while true; do
-                    read -p "是否启用用户认证? (y/n): " enable_auth
+                    read -r -p "是否启用用户认证? (y/n): " enable_auth || return 1
                     case ${enable_auth} in
                         [Yy])
-                            read -p "请输入用户名: " user
+                            read -r -p "请输入用户名: " user || return 1
                             while [ -z "${user}" ]; do
-                                read -p "用户名不能为空，请重新输入: " user
+                                read -r -p "用户名不能为空，请重新输入: " user || return 1
                             done
 
-                            read -s -p "请输入密码: " password
+                            read -rs -p "请输入密码: " password || return 1
                             echo
                             while [ -z "${password}" ]; do
-                                read -s -p "密码不能为空，请重新输入: " password
+                                read -rs -p "密码不能为空，请重新输入: " password || return 1
                                 echo
                             done
                             break
@@ -1660,7 +1647,7 @@ get_modify_config() {
             [Nn])
                 # 保持当前设置
                 if [ -n "${user}" ]; then
-                    read -s -p "请重新输入密码 (留空表示保留当前密码): " input_password
+                    read -rs -p "请重新输入密码 (留空表示保留当前密码): " input_password || return 1
                     echo
                     if [ -n "${input_password}" ]; then
                         password="${input_password}"
@@ -1678,8 +1665,7 @@ get_modify_config() {
     done
 
     # 获取IP白名单
-    echo -e "${YELLOW}提示: 修改白名单将自动更新防火墙规则${RESET}"
-    read -p "请输入IP白名单（多个IP用逗号分隔，留空表示保持当前设置，输入 'clear' 清除白名单）: " input_whitelist
+    read -r -p "请输入IP白名单（多个IP用逗号分隔，留空表示保持当前设置，输入 'clear' 清除白名单）: " input_whitelist || return 1
     if [ "${input_whitelist}" = "clear" ]; then
         whitelist=""
     elif [ -n "${input_whitelist}" ]; then
@@ -1691,13 +1677,9 @@ get_modify_config() {
     echo "  端口: ${port}"
     echo "  认证: $(if [ -n "${user}" ] && [ -n "${password}" ]; then echo "启用 (用户名: ${user})"; else echo "禁用"; fi)"
     echo "  白名单: $(if [ -n "${whitelist}" ]; then echo "${whitelist}"; else echo "无"; fi)"
-    if [ -n "${whitelist}" ]; then
-        echo -e "  防火墙: ${CYAN}将自动更新防火墙规则${RESET}"
-    fi
-
     # 确认修改
     while true; do
-        read -p "确认修改配置? (y/n) [默认: y]: " confirm
+        read -r -p "确认修改配置? (y/n) [默认: y]: " confirm || return 1
         confirm=${confirm:-y}
 
         case ${confirm} in
@@ -1826,13 +1808,18 @@ get_current_config_auto() {
     local -a service_args override_keys=() override_values=()
     local LC_ALL=C
 
-    service_file=$(get_service_file "${init_system}") || return 1
-    if [ ! -f "${service_file}" ]; then
-        echo -e "${RED}Brume 服务未安装，无法更新${RESET}" >&2
-        return 1
+    if [ "${init_system}" != standalone ]; then
+        service_file=$(get_service_file "${init_system}") || return 1
+        if [ ! -f "${service_file}" ]; then
+            echo -e "${RED}Brume 服务未安装，请先安装服务${RESET}" >&2
+            return 1
+        fi
     fi
 
     case "${init_system}" in
+        standalone)
+            service_args=(--config "${CONFIG_FILE}")
+            ;;
         systemd)
             validate_systemd_service_definition || return 1
             if [ -L "${service_file}" ]; then
@@ -1941,7 +1928,9 @@ get_current_config_auto() {
 upgrade() (
     local init_system=$1
     acquire_mutation_lock || return 1
-    require_independent_worker_tools || return 1
+    if [ "${init_system}" != standalone ]; then
+        require_independent_worker_tools || return 1
+    fi
     echo -e "${BLUE}=== Brume 服务器一键更新 ===${RESET}"
 
     # 1. 自动提取参数
@@ -1949,14 +1938,14 @@ upgrade() (
     echo -e "已提取当前配置: 端口 ${port}, 用户 ${user:-无}, 白名单 ${whitelist:-无限制}"
 
     # 2. 检测系统架构
-    arch=$(check_architecture)
+    arch=$(check_architecture) || return 1
     
     # 3. 获取最新版本
     version=$(get_latest_version)
     echo -e "准备更新至版本: ${version}"
 
     # 4. 下载并检查新程序
-    prepare_binary "${version}" "${arch}"
+    prepare_binary "${version}" "${arch}" || return 1
 
     # 5. 保存完整有效配置，保留自定义文件和命令行覆盖后的实际行为
     if ! write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}"; then
@@ -1966,6 +1955,10 @@ upgrade() (
 
     # 6. 保持旧进程运行，原子替换程序并更新服务定义
     install_prepared_binary || return 1
+    if [ "${init_system}" = standalone ]; then
+        echo "Brume 程序已更新，请通过容器或进程管理器重启后生效。"
+        return 0
+    fi
     create_service "${init_system}" || return 1
 
     # 7. 端口和白名单未改变，无需重建防火墙规则
@@ -1994,17 +1987,13 @@ main() {
     local init_system
     init_system=$(detect_init_system)
 
-    if [ "${init_system}" = "unknown" ]; then
-        echo -e "${RED}无法检测到支持的服务管理器 (systemd/openrc/sysvinit)${RESET}"
-        echo -e "${RED}请确保系统使用 systemd、OpenRC 或 SysVinit 作为初始化系统${RESET}"
-        exit 1
+    echo -e "${CYAN}检测到服务管理器: ${init_system}${RESET}"
+    if [ "${init_system}" != standalone ]; then
+        echo -e "${CYAN}检测到防火墙工具: $(detect_firewall)${RESET}"
     fi
 
-    echo -e "${CYAN}检测到服务管理器: ${init_system}${RESET}"
-    echo -e "${CYAN}检测到防火墙工具: $(detect_firewall)${RESET}"
-
     # 交互式获取操作类型
-    get_action
+    get_action || return 1
 
     # 根据操作类型执行相应的功能
     case "${action}" in
@@ -2012,10 +2001,10 @@ main() {
             echo -e "${BLUE}=== Brume 服务器安装 ===${RESET}"
 
             # 交互式获取安装配置
-            get_install_config
+            get_install_config || { echo "未收到完整的安装配置。" >&2; return 1; }
 
             # 检测系统架构
-            arch=$(check_architecture)
+            arch=$(check_architecture) || return 1
             echo "系统架构: $arch"
 
             # 获取版本号
@@ -2026,14 +2015,13 @@ main() {
             fi
 
             # 下载并安装
-            download_and_install "${version}" "${arch}"
+            download_and_install "${version}" "${arch}" || return 1
 
-            # 创建仅使用配置文件路径的服务
-            write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}" || exit 1
-            create_service "${init_system}"
-
-            # 设置防火墙规则
-            setup_firewall "${port}" "${whitelist}"
+            write_config_file "${port}" "${user}" "${password}" "${whitelist}" "${tcp_timeout}" "${udp_timeout}" "${dns_servers}" || return 1
+            if [ "${init_system}" != standalone ]; then
+                create_service "${init_system}" || return 1
+                setup_firewall "${port}" "${whitelist}" || return 1
+            fi
 
             # 启动服务
             start_service "${init_system}"
@@ -2041,7 +2029,7 @@ main() {
         uninstall)
             # 确认卸载
             while true; do
-                read -p "确定要卸载Brume服务器吗? 此操作将删除所有相关文件、配置和防火墙规则。(y/n) [默认: n]: " confirm
+                read -r -p "确定要卸载Brume服务器吗? 此操作将删除所有相关文件、配置和防火墙规则。(y/n) [默认: n]: " confirm || return 1
                 confirm=${confirm:-n}
 
                 case ${confirm} in
@@ -2063,7 +2051,7 @@ main() {
             echo -e "${BLUE}=== Brume 服务器配置修改 ===${RESET}"
 
             # 交互式获取修改配置
-            get_modify_config "${init_system}"
+            get_modify_config "${init_system}" || { echo "未收到完整的修改配置。" >&2; return 1; }
 
             # 执行修改操作（包含防火墙规则更新）
             modify "${init_system}"

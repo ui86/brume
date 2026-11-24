@@ -12,6 +12,7 @@ fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "${script_dir}/../install.sh"
 has_sudo=false
+[[ "$(detect_init_system)" == systemd ]]
 binary=$(realpath -- "${1:?需要已构建的 brume 程序}")
 [[ -x "${binary}" && "${binary##*/}" == brume ]]
 test_dir=$(mktemp -d /tmp/brume-service-ci.XXXXXX)

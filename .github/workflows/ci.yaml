@@ -47,3 +47,14 @@ jobs:
         run: |
           sudo env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
             BRUME_CI_SYSTEMD=1 bash tests/linux_systemd.bash "$PWD/target/debug/brume"
+      - name: Verify installation in containers without an init system
+        run: |
+          docker run --rm --cap-drop NET_ADMIN --tmpfs /tmp:rw,noexec -v "$PWD:/repo:ro" debian:bookworm-slim sh -ec '
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd nftables iptables
+            bash /repo/tests/linux_container.bash debian
+          '
+          docker run --rm --cap-drop NET_ADMIN --tmpfs /tmp:rw,noexec -v "$PWD:/repo:ro" alpine:3.23 sh -ec '
+            apk add --no-cache bash openrc nftables iptables util-linux
+            bash /repo/tests/linux_container.bash alpine
+          '
