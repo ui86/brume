@@ -7,6 +7,7 @@ use tokio::task::JoinSet;
 
 /// RFC 8305 推荐的阶梯连接延迟（250 毫秒）
 pub const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+pub(crate) const TARGET_TIMEOUT_MESSAGE: &str = "Target connection timed out";
 
 /// 对目标地址列表进行交替排序：优先 IPv6，交替排列 IPv6 与 IPv4
 pub fn interleave_addresses(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
@@ -49,21 +50,24 @@ pub async fn happy_eyeballs_connect(
     total_timeout: Duration,
 ) -> io::Result<TcpStream> {
     if addresses.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "目标地址列表为空"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No target addresses",
+        ));
     }
 
     // 单个地址快速通道
     if addresses.len() == 1 {
         return tokio::time::timeout(total_timeout, TcpStream::connect(addresses[0]))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, TARGET_TIMEOUT_MESSAGE))?;
     }
 
     let ordered = interleave_addresses(addresses);
 
     tokio::time::timeout(total_timeout, race_connect(ordered))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, TARGET_TIMEOUT_MESSAGE))?
 }
 
 enum FamilyConnectError {
@@ -128,7 +132,7 @@ where
     // 总预算同时覆盖解析与连接，避免 DNS 重试额外延长连接超时。
     tokio::time::timeout(total_timeout, race)
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, TARGET_TIMEOUT_MESSAGE))?
 }
 
 async fn race_connect(addresses: Vec<SocketAddr>) -> io::Result<TcpStream> {
@@ -189,7 +193,7 @@ async fn race_connect(addresses: Vec<SocketAddr>) -> io::Result<TcpStream> {
         }
     }
 
-    Err(last_error.unwrap_or_else(|| io::Error::other("所有目标连接尝试均失败")))
+    Err(last_error.unwrap_or_else(|| io::Error::other("All connection attempts failed")))
 }
 
 #[cfg(test)]

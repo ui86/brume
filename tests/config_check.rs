@@ -29,13 +29,20 @@ fn configuration_check_validates_without_binding_or_exposing_secrets() {
         }
         let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
-        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "Configuration is valid");
         assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
     }
-    for contents in [
-        "whitelist=不是有效地址\n",
-        "username=admin\n",
-        "udp_timeout=18446744073709551615\n",
+    for (contents, message) in [
+        ("whitelist=不是有效地址\n", "Invalid allowlist address"),
+        (
+            "username=admin\n",
+            "Username and password must be set together",
+        ),
+        (
+            "udp_timeout=18446744073709551615\n",
+            "UDP timeout exceeds the system clock range",
+        ),
     ] {
         fs::write(&path, contents).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_brume"))
@@ -45,6 +52,7 @@ fn configuration_check_validates_without_binding_or_exposing_secrets() {
             .output()
             .unwrap();
         assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
     }
     fs::remove_file(path).unwrap();
     fs::remove_dir(directory).unwrap();

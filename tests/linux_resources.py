@@ -104,7 +104,7 @@ def main():
             for _ in range(96):
                 held.append(socket.create_connection(("127.0.0.1", port), timeout=0.5))
             wait_for(lambda: descriptor_count(process) >= 64, "未触发真实文件描述符耗尽")
-            wait_for(lambda: "接受连接失败" in log_path.read_text(), "未进入 accept 错误恢复分支")
+            wait_for(lambda: "Failed to accept connection" in log_path.read_text(), "未进入 accept 错误恢复分支")
             roundtrip(active)
 
             before = cpu_ticks(process)

@@ -9,20 +9,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let config = match command {
         Command::CheckConfig(_) => {
-            println!("配置校验通过");
+            println!("Configuration is valid");
             return Ok(());
         }
         Command::Serve(config) => config,
     };
     if config.whitelist.is_empty() {
-        eprintln!("警告：白名单为空，所有 IP 均可连接");
+        eprintln!("Warning: The IP allowlist is empty. Connections from any IP are allowed");
     }
     let port = config.port;
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();
     ctrlc::set_handler(move || signal.cancel())?;
     let server = Server::bind(config, shutdown)?;
-    eprintln!("Brume 正在监听 TCP/UDP 端口 {port}");
+    eprintln!("Brume is listening on TCP/UDP port {port}");
     server.run()?;
     Ok(())
 }

@@ -83,7 +83,7 @@ impl DnsResolver {
         if addresses.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "目标地址没有解析结果",
+                "No addresses found for the target",
             ));
         }
         Ok(addresses)
@@ -112,7 +112,7 @@ impl DnsResolver {
             Box::pin(async move {
                 tokio::time::timeout_at(deadline, lookup_family(&resolver, &name, port, ipv6))
                     .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP 目标域名解析超时"))?
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP lookup timed out"))?
             }) as PendingLookup
         };
         let mut ipv6 = make_lookup(true);
@@ -178,7 +178,7 @@ impl DnsResolver {
             if handle.runtime_flavor() != RuntimeFlavor::MultiThread {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "当前运行时不支持阻塞解析，请改用异步 lookup 方法",
+                    "Use the async lookup method on a single-threaded runtime",
                 ));
             }
             tokio::task::block_in_place(|| handle.block_on(self.lookup(target)))
@@ -211,7 +211,7 @@ pub(crate) async fn lookup_family<P: ConnectionProvider>(
     if addresses.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "目标地址没有解析结果",
+            "No addresses found for the target",
         ));
     }
     Ok(addresses)
@@ -546,7 +546,7 @@ pub(crate) mod tests {
         .expect("DNS 查询超出了 TCP 连接总预算")
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(error.to_string(), "连接目标超时");
+        assert_eq!(error.to_string(), "Target connection timed out");
     }
 
     #[tokio::test]

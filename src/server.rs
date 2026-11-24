@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::dns::{DnsResolver, PendingLookup};
+use crate::happy_eyeballs::TARGET_TIMEOUT_MESSAGE;
 use crate::protocol::{self, Host, Target};
 use hickory_resolver::net::NetError;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -27,6 +28,7 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const UDP_DNS_FALLBACK_GRACE: Duration = Duration::from_millis(50);
 const INITIAL_TCP_BUFFER_SIZE: usize = 8192;
 const MAX_TCP_BUFFER_SIZE: usize = 65536;
+const UDP_CLIENT_ADDRESS_MISMATCH: &str = "UDP client address differs from the control connection";
 static NEXT_UDP_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
 type Associations = Arc<Mutex<AssociationRegistry>>;
@@ -230,7 +232,7 @@ impl Server {
             if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "单线程异步运行时中请使用 Server::run_async",
+                    "Use Server::run_async on a single-threaded async runtime",
                 ));
             }
             tokio::task::block_in_place(|| handle.block_on(self.run_async()))
@@ -270,13 +272,13 @@ impl Server {
                 _ = self.shutdown.cancelled() => break,
                 Some(outcome) = clients.join_next(), if !clients.is_empty() => {
                     if let Err(error) = outcome {
-                        eprintln!("客户端任务异常退出：{error}");
+                        eprintln!("Client task failed: {error}");
                     }
                 }
                 outcome = &mut udp_task => {
                     udp_result = Some(match outcome {
                         Ok(Ok(())) if !self.shutdown.is_cancelled() => {
-                            Err(io::Error::other("UDP 任务意外退出"))
+                            Err(io::Error::other("UDP task exited unexpectedly"))
                         }
                         Ok(result) => result,
                         Err(error) => Err(io::Error::other(error)),
@@ -304,13 +306,13 @@ impl Server {
                                     handle_client(stream, config, dns, udp, associations, id, shutdown).await
                                     && should_log_client_error(&error)
                                 {
-                                    eprintln!("连接 {address} 处理失败：{error}");
+                                    eprintln!("Connection from {address} failed: {error}");
                                 }
                             });
                         }
                         Err(error) => {
                             // 连接中断或描述符耗尽不应使全部代理连接退出；退避避免持续忙等。
-                            eprintln!("接受连接失败，稍后重试：{error}");
+                            eprintln!("Failed to accept connection. Retrying: {error}");
                             tokio::select! {
                                 _ = self.shutdown.cancelled() => break,
                                 _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => {}
@@ -329,7 +331,7 @@ impl Server {
             Some(result) => result,
             None => udp_task
                 .await
-                .map_err(|_| io::Error::other("UDP 任务异常退出"))?,
+                .map_err(|_| io::Error::other("UDP task failed"))?,
         };
         *self.associations.lock().unwrap() = AssociationRegistry::default();
         udp_result
@@ -349,7 +351,7 @@ async fn negotiate(stream: &mut tokio::net::TcpStream, config: &Config) -> io::R
     if header[0] != 5 || header[1] == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "SOCKS5 协商请求无效",
+            "Invalid SOCKS5 greeting",
         ));
     }
     let mut methods = vec![0u8; usize::from(header[1])];
@@ -359,7 +361,7 @@ async fn negotiate(stream: &mut tokio::net::TcpStream, config: &Config) -> io::R
         stream.write_all(&[5, 255]).await?;
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "客户端没有提供可用的认证方法",
+            "Client offered no supported authentication method",
         ));
     }
     stream.write_all(&[5, selected]).await?;
@@ -369,7 +371,7 @@ async fn negotiate(stream: &mut tokio::net::TcpStream, config: &Config) -> io::R
         if auth_header[0] != 1 || auth_header[1] == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "用户名密码认证请求无效",
+                "Invalid username/password authentication request",
             ));
         }
         let mut username = vec![0u8; usize::from(auth_header[1])];
@@ -380,7 +382,7 @@ async fn negotiate(stream: &mut tokio::net::TcpStream, config: &Config) -> io::R
             stream.write_all(&[1, 1]).await?;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "密码不能为空",
+                "Password must not be empty",
             ));
         }
         let mut password = vec![0u8; usize::from(password_length[0])];
@@ -391,7 +393,7 @@ async fn negotiate(stream: &mut tokio::net::TcpStream, config: &Config) -> io::R
         if !allowed {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "用户名或密码错误",
+                "Invalid username or password",
             ));
         }
     }
@@ -416,16 +418,18 @@ fn unspecified(ip: IpAddr) -> SocketAddr {
 fn should_log_client_error(error: &io::Error) -> bool {
     if matches!(
         error.kind(),
-        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NetworkUnreachable
     ) {
         return false;
     }
     if error.kind() == io::ErrorKind::PermissionDenied
-        && error.to_string() == "UDP 客户端地址与控制连接不符"
+        && error.to_string() == UDP_CLIENT_ADDRESS_MISMATCH
     {
         return false;
     }
-    if error.kind() == io::ErrorKind::TimedOut && error.to_string() == "连接目标超时" {
+    if error.kind() == io::ErrorKind::TimedOut && error.to_string() == TARGET_TIMEOUT_MESSAGE {
         return false;
     }
     !error
@@ -449,7 +453,7 @@ async fn handle_client(
     let mut first = [0];
     let received = tokio::time::timeout_at(deadline, stream.peek(&mut first))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "读取代理协议超时"))??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Proxy protocol read timed out"))??;
     if received == 0 {
         return Ok(());
     }
@@ -458,7 +462,7 @@ async fn handle_client(
     }
     tokio::time::timeout_at(deadline, negotiate(&mut stream, &config))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 协商超时"))??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 negotiation timed out"))??;
 
     let (command, target) =
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, protocol::read_request_async(&mut stream))
@@ -477,7 +481,12 @@ async fn handle_client(
                 }
                 return Err(error);
             }
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "读取请求超时")),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Request read timed out",
+                ));
+            }
         };
 
     match command {
@@ -561,13 +570,16 @@ async fn with_tcp_idle_timeout(
             .borrow_and_update()
             .checked_add(idle_timeout)
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "TCP 超时超出系统时钟范围")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "TCP timeout exceeds clock range",
+                )
             })?;
         tokio::select! {
             result = &mut transfer => return result,
             _ = tokio::time::sleep_until(deadline) => {
                 if tokio::time::Instant::now().duration_since(*activity.borrow()) >= idle_timeout {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP 连接空闲超时"));
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP idle timeout"));
                 }
             }
             changed = activity.changed() => {
@@ -625,7 +637,7 @@ async fn associate(
         protocol::write_reply_async(&mut stream, protocol::CONNECTION_NOT_ALLOWED, address).await?;
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "UDP 关联必须声明非零客户端端口",
+            "UDP association requires a nonzero client port",
         ));
     }
     match target.host {
@@ -634,7 +646,7 @@ async fn associate(
             protocol::write_reply_async(&mut stream, protocol::SERVER_FAILURE, address).await?;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "UDP 客户端地址与控制连接不符",
+                UDP_CLIENT_ADDRESS_MISMATCH,
             ));
         }
         Host::Domain(_) => {
@@ -643,7 +655,7 @@ async fn associate(
                 .await?;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "UDP 客户端地址必须是 IP",
+                "UDP client address must be an IP address",
             ));
         }
         _ => {}
@@ -670,7 +682,7 @@ async fn associate(
         protocol::write_reply_async(&mut stream, protocol::SERVER_FAILURE, address).await?;
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
-            "UDP 客户端端点已有控制连接",
+            "UDP client endpoint already has a control connection",
         ));
     }
     if let Err(error) = protocol::write_reply_async(&mut stream, protocol::SUCCESS, relay).await {
@@ -716,7 +728,7 @@ async fn udp_loop(
             _ = shutdown.cancelled() => break Ok(()),
             Some(outcome) = packets.join_next(), if !packets.is_empty() => {
                 if let Err(error) = outcome {
-                    eprintln!("UDP 数据报任务异常退出：{error}");
+                    eprintln!("UDP packet task failed: {error}");
                 }
                 continue;
             }
@@ -1077,6 +1089,16 @@ mod tests {
     use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn network_unreachable_connection_errors_are_silent() {
+        let unreachable = io::Error::from(io::ErrorKind::NetworkUnreachable);
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        assert!(!should_log_client_error(&unreachable));
+        assert!(should_log_client_error(&refused));
+        #[cfg(target_os = "linux")]
+        assert!(!should_log_client_error(&io::Error::from_raw_os_error(101)));
+    }
 
     fn start_server(
         username: &str,

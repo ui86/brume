@@ -33,7 +33,7 @@ impl Target {
         if addresses.is_empty() {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "目标地址没有解析结果",
+                "No addresses found for the target",
             ))
         } else {
             Ok(addresses)
@@ -65,11 +65,12 @@ fn read_target(reader: &mut impl Read, atyp: u8) -> io::Result<Target> {
             let mut length = [0];
             reader.read_exact(&mut length)?;
             if length[0] == 0 {
-                return Err(invalid_data("域名不能为空"));
+                return Err(invalid_data("Domain name must not be empty"));
             }
             let mut name = vec![0; usize::from(length[0])];
             reader.read_exact(&mut name)?;
-            let name = String::from_utf8(name).map_err(|_| invalid_data("域名编码无效"))?;
+            let name =
+                String::from_utf8(name).map_err(|_| invalid_data("Invalid UTF-8 in domain"))?;
             Host::Domain(name)
         }
         4 => {
@@ -77,7 +78,7 @@ fn read_target(reader: &mut impl Read, atyp: u8) -> io::Result<Target> {
             reader.read_exact(&mut octets)?;
             Host::Ip(IpAddr::V6(Ipv6Addr::from(octets)))
         }
-        _ => return Err(invalid_data("不支持的地址类型")),
+        _ => return Err(invalid_data("Unsupported address type")),
     };
     let mut port = [0; 2];
     reader.read_exact(&mut port)?;
@@ -91,7 +92,7 @@ pub fn read_request(reader: &mut impl Read) -> io::Result<(u8, Target)> {
     let mut header = [0; 4];
     reader.read_exact(&mut header)?;
     if header[0] != 5 || header[2] != 0 {
-        return Err(invalid_data("SOCKS5 请求头无效"));
+        return Err(invalid_data("Invalid SOCKS5 request header"));
     }
     Ok((header[1], read_target(reader, header[3])?))
 }
@@ -106,7 +107,7 @@ pub fn read_reply(reader: &mut impl Read) -> io::Result<(u8, Target)> {
     let mut header = [0; 4];
     reader.read_exact(&mut header)?;
     if header[0] != 5 || header[2] != 0 {
-        return Err(invalid_data("SOCKS5 回复头无效"));
+        return Err(invalid_data("Invalid SOCKS5 reply header"));
     }
     Ok((header[1], read_target(reader, header[3])?))
 }
@@ -131,11 +132,12 @@ async fn read_target_async<R: tokio::io::AsyncReadExt + Unpin>(
             let mut length = [0];
             reader.read_exact(&mut length).await?;
             if length[0] == 0 {
-                return Err(invalid_data("域名不能为空"));
+                return Err(invalid_data("Domain name must not be empty"));
             }
             let mut name = vec![0; usize::from(length[0])];
             reader.read_exact(&mut name).await?;
-            let name = String::from_utf8(name).map_err(|_| invalid_data("域名编码无效"))?;
+            let name =
+                String::from_utf8(name).map_err(|_| invalid_data("Invalid UTF-8 in domain"))?;
             Host::Domain(name)
         }
         4 => {
@@ -143,7 +145,7 @@ async fn read_target_async<R: tokio::io::AsyncReadExt + Unpin>(
             reader.read_exact(&mut octets).await?;
             Host::Ip(IpAddr::V6(Ipv6Addr::from(octets)))
         }
-        _ => return Err(invalid_data("不支持的地址类型")),
+        _ => return Err(invalid_data("Unsupported address type")),
     };
     let mut port = [0; 2];
     reader.read_exact(&mut port).await?;
@@ -159,7 +161,7 @@ pub async fn read_request_async<R: tokio::io::AsyncReadExt + Unpin>(
     let mut header = [0; 4];
     reader.read_exact(&mut header).await?;
     if header[0] != 5 || header[2] != 0 {
-        return Err(invalid_data("SOCKS5 请求头无效"));
+        return Err(invalid_data("Invalid SOCKS5 request header"));
     }
     Ok((header[1], read_target_async(reader, header[3]).await?))
 }
@@ -180,7 +182,7 @@ pub async fn read_reply_async<R: tokio::io::AsyncReadExt + Unpin>(
     let mut header = [0; 4];
     reader.read_exact(&mut header).await?;
     if header[0] != 5 || header[2] != 0 {
-        return Err(invalid_data("SOCKS5 回复头无效"));
+        return Err(invalid_data("Invalid SOCKS5 reply header"));
     }
     Ok((header[1], read_target_async(reader, header[3]).await?))
 }
@@ -216,7 +218,7 @@ fn encode_target(bytes: &mut Vec<u8>, target: &Target) -> io::Result<()> {
             if name.is_empty() || name.len() > 255 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "域名长度必须在 1 到 255 字节之间",
+                    "Domain name length must be between 1 and 255 bytes",
                 ));
             }
             bytes.push(3);
@@ -230,7 +232,9 @@ fn encode_target(bytes: &mut Vec<u8>, target: &Target) -> io::Result<()> {
 
 pub fn parse_datagram(bytes: &[u8]) -> io::Result<(Target, &[u8])> {
     if bytes.len() < 4 || bytes[..3] != [0, 0, 0] {
-        return Err(invalid_data("UDP 数据报头无效或不支持分片"));
+        return Err(invalid_data(
+            "Invalid UDP header or unsupported fragmentation",
+        ));
     }
     let mut reader = &bytes[4..];
     let target = read_target(&mut reader, bytes[3])?;

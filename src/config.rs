@@ -71,12 +71,12 @@ impl Whitelist {
             if let Some((address, bits)) = entry.split_once('/') {
                 let ip: IpAddr = address
                     .parse()
-                    .map_err(|_| format!("无效的白名单地址：{entry}"))?;
+                    .map_err(|_| format!("Invalid allowlist address: {entry}"))?;
                 let bits: u8 = bits
                     .parse()
-                    .map_err(|_| format!("无效的白名单网段：{entry}"))?;
+                    .map_err(|_| format!("Invalid allowlist network: {entry}"))?;
                 if bits > if ip.is_ipv4() { 32 } else { 128 } {
-                    return Err(format!("无效的白名单网段：{entry}"));
+                    return Err(format!("Invalid allowlist network: {entry}"));
                 }
                 let (ip, bits) = match ip {
                     IpAddr::V6(ip6) if ip6.to_ipv4_mapped().is_some() && bits >= 96 => {
@@ -88,13 +88,13 @@ impl Whitelist {
             } else {
                 let ip = entry
                     .parse()
-                    .map_err(|_| format!("无效的白名单地址：{entry}"))?;
+                    .map_err(|_| format!("Invalid allowlist address: {entry}"))?;
                 let ip = normalize(ip);
                 result.push(ip, if ip.is_ipv4() { 32 } else { 128 });
             }
         }
         if !value.trim().is_empty() && result.is_empty() {
-            return Err("白名单至少需要一个有效的 IP 或网段".into());
+            return Err("The allowlist must contain a valid IP address or network".into());
         }
         // 配置加载时合并重叠和相邻范围，连接检查只检索对应地址族的范围。
         result.ipv4 = merge_ranges(result.ipv4, |value| value.checked_add(1));
@@ -213,18 +213,20 @@ impl Config {
                     | "--udp-timeout"
                     | "--dns-servers"
             ) {
-                return Err(format!("未知参数：{key}"));
+                return Err(format!("Unknown argument: {key}"));
             }
             let value = match inline {
                 Some(value) => value.to_owned(),
-                None => args.next().ok_or_else(|| format!("参数 {key} 缺少值"))?,
+                None => args
+                    .next()
+                    .ok_or_else(|| format!("Missing value for {key}"))?,
             };
             if key == "--config" {
                 if value.is_empty() {
-                    return Err("配置文件路径不能为空".into());
+                    return Err("The config file path must not be empty".into());
                 }
                 if config_path.replace(value).is_some() {
-                    return Err("只能指定一个配置文件".into());
+                    return Err("Only one config file may be specified".into());
                 }
             } else {
                 overrides.push((key.to_owned(), value));
@@ -256,7 +258,7 @@ impl Config {
 
     fn read_file(&mut self, path: &Path) -> Result<(), String> {
         let contents = fs::read_to_string(path)
-            .map_err(|error| format!("读取配置文件 {} 失败：{error}", path.display()))?;
+            .map_err(|error| format!("Could not read config file {}: {error}", path.display()))?;
         for (index, line) in contents.lines().enumerate() {
             let line = line.strip_suffix('\r').unwrap_or(line);
             if line.trim().is_empty() || line.trim_start().starts_with('#') {
@@ -264,7 +266,7 @@ impl Config {
             }
             let (key, value) = line
                 .split_once('=')
-                .ok_or_else(|| format!("配置文件第 {} 行缺少等号", index + 1))?;
+                .ok_or_else(|| format!("Missing '=' on config line {}", index + 1))?;
             let option = match key.trim() {
                 "port" => "--port",
                 "username" => "--user",
@@ -273,10 +275,10 @@ impl Config {
                 "tcp_timeout" => "--tcp-timeout",
                 "udp_timeout" => "--udp-timeout",
                 "dns_servers" => "--dns-servers",
-                _ => return Err(format!("配置文件第 {} 行存在未知配置项", index + 1)),
+                _ => return Err(format!("Unknown setting on config line {}", index + 1)),
             };
             self.apply_value(option, value)
-                .map_err(|error| format!("配置文件第 {} 行：{error}", index + 1))?;
+                .map_err(|error| format!("Config line {}: {error}", index + 1))?;
         }
         Ok(())
     }
@@ -286,9 +288,9 @@ impl Config {
             "-p" | "--port" => {
                 self.port = value
                     .parse()
-                    .map_err(|_| "端口必须在 1 到 65535 之间".to_string())?;
+                    .map_err(|_| "Port must be between 1 and 65535".to_string())?;
                 if self.port == 0 {
-                    return Err("端口必须在 1 到 65535 之间".into());
+                    return Err("Port must be between 1 and 65535".into());
                 }
             }
             "-user" | "--user" => self.username = value.to_owned(),
@@ -297,13 +299,13 @@ impl Config {
             "--tcp-timeout" => {
                 let seconds: u64 = value
                     .parse()
-                    .map_err(|_| "TCP 超时必须是非负整数秒".to_string())?;
+                    .map_err(|_| "TCP timeout must be whole seconds (0 or more)".to_string())?;
                 self.tcp_timeout = (seconds > 0).then(|| Duration::from_secs(seconds));
             }
             "--udp-timeout" => {
                 let seconds: u64 = value
                     .parse()
-                    .map_err(|_| "UDP 超时必须是非负整数秒".to_string())?;
+                    .map_err(|_| "UDP timeout must be whole seconds (0 or more)".to_string())?;
                 self.udp_timeout = Duration::from_secs(seconds);
             }
             "--dns-servers" => {
@@ -323,34 +325,34 @@ impl Config {
                             .ok_or(())
                     })
                     .collect();
-                let servers =
-                    servers.map_err(|_| "DNS 服务器必须是逗号分隔的 IP 或 IP:端口".to_string())?;
+                let servers = servers
+                    .map_err(|_| "Expected comma-separated DNS IPs or IP:port pairs".to_string())?;
                 if servers.is_empty()
                     || servers.len() > 8
                     || servers
                         .iter()
                         .any(|server| server.ip().is_unspecified() || server.port() == 0)
                 {
-                    return Err("DNS 服务器数量必须为 1 到 8，且地址和端口必须有效".into());
+                    return Err("Specify 1 to 8 DNS servers with valid addresses and ports".into());
                 }
                 self.dns_servers = servers;
             }
-            _ => return Err(format!("未知参数：{key}")),
+            _ => return Err(format!("Unknown argument: {key}")),
         }
         Ok(())
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.username.is_empty() != self.password.is_empty() {
-            return Err("用户名和密码必须同时设置".into());
+            return Err("Username and password must be set together".into());
         }
         if self.username.len() > 255 || self.password.len() > 255 {
-            return Err("用户名和密码不能超过 255 字节".into());
+            return Err("Username and password must each be at most 255 bytes".into());
         }
         let now = Instant::now();
         for (name, timeout) in [("TCP", self.tcp_timeout), ("UDP", Some(self.udp_timeout))] {
             if timeout.is_some_and(|timeout| now.checked_add(timeout).is_none()) {
-                return Err(format!("{name} 超时超过系统时钟支持的范围"));
+                return Err(format!("{name} timeout exceeds the system clock range"));
             }
         }
         Ok(())
