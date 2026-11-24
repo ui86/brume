@@ -1,6 +1,6 @@
 # Docker 部署
 
-镜像仓库为 `ghcr.io/ui86/brume`，Docker 会按宿主机自动选择 `linux/amd64` 或 `linux/arm64`。镜像标签与 GitHub Release 的标签一致，`latest` 指向已发布镜像的最新稳定版。镜像的功能随 Release 二进制而定，例如 `1.0.8` 提供 SOCKS5。
+镜像仓库为 `ghcr.io/ui86/brume`，Docker 会按宿主机自动选择 `linux/amd64` 或 `linux/arm64`。镜像标签与 GitHub Release 的标签一致，`latest` 指向已发布镜像的最新稳定版。从 `1.0.9` 起，镜像支持 HTTP 和 SOCKS5 共用同一端口。
 
 如果镜像仓库要求认证，先使用具有 `read:packages` 权限的 GitHub 令牌登录 `ghcr.io`。首次发布的包由仓库管理员在 GitHub Packages 设置中管理可见性。[GitHub 容器仓库说明](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
 
