@@ -23,6 +23,7 @@ jobs:
       - name: Check installer
         run: |
           bash -n install.sh
+          bash -n install-local.sh
           for test_script in tests/*.bash; do
             case "$test_script" in tests/linux_*) continue ;; esac
             bash "$test_script"
@@ -53,8 +54,10 @@ jobs:
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd nftables iptables
             bash /repo/tests/linux_container.bash debian
+            BRUME_LOCAL_CONTAINER=1 TMPDIR=/root bash /repo/tests/local_install.bash
           '
           docker run --rm --cap-drop NET_ADMIN --tmpfs /tmp:rw,noexec -v "$PWD:/repo:ro" alpine:3.23 sh -ec '
             apk add --no-cache bash openrc nftables iptables flock
             bash /repo/tests/linux_container.bash alpine
+            BRUME_LOCAL_CONTAINER=1 TMPDIR=/root bash /repo/tests/local_install.bash
           '

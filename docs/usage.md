@@ -55,6 +55,47 @@ exec /usr/local/bin/brume --config /etc/brume/brume.conf
 
 修改配置要求当前程序支持 `--check-config`，并安装 `flock`、`setsid` 和 `nohup`。脚本先在旧服务运行期间校验候选配置，再交给脱离 SSH 会话的独立进程应用、重启并检查服务状态；失败时恢复原配置、服务定义和原防火墙规则。修改与升级互斥执行。结果写入仅 root 可读的 `/etc/brume/modify.log.*`；若恢复也失败，会保留私有事务目录中的备份并在日志中提示位置。
 
+## 本地安装
+
+`install-local.sh` 基于上述安装脚本，沿用安装、卸载、修改配置和更新菜单，以及服务管理器、防火墙和配置事务逻辑。它只读取本地二进制，不调用 curl、不访问 GitHub，也不需要旁边存在 `install.sh`。
+
+将匹配 Linux 架构的 `brume` 二进制与 `install-local.sh` 放在同一目录，以 root 运行：
+
+```text
+/opt/brume/
+├── brume
+└── install-local.sh
+```
+
+```bash
+cd /opt/brume
+bash install-local.sh
+```
+
+选择 `1` 安装，按提示设置端口、认证和白名单。默认安装在**脚本所在目录**，从其他工作目录调用也一样。程序为 `/opt/brume/brume`，配置为 `/opt/brume/.brume/brume.conf`；配置目录权限为 `0700`，文件权限为 `0600`。重复安装会保留现有配置。普通空格目录可用；脚本会拒绝服务模板无法安全处理的特殊路径字符，并提示更换目录。
+
+本地脚本同样使用 Bash。Debian 通常已有 Bash；精简系统需要预先准备依赖。Alpine 可在联网准备阶段执行：
+
+```sh
+apk add --no-cache bash flock util-linux-misc coreutils
+```
+
+其中 `flock`、`setsid` 和 `nohup` 用于修改配置和更新的独立事务。离线机器需提前准备这些工具。二进制建议使用项目 Release 中的 musl 构建，兼容 Debian 的 glibc 和 Alpine 的 musl 环境；安装前会在目标目录试运行 `--help` 检查可执行性和配置文件支持。
+
+服务名为 `brume-local`。在 Debian/systemd 上使用 `systemctl status brume-local`，在 Alpine/OpenRC 上使用 `rc-service brume-local status`；SysVinit 使用 `/etc/init.d/brume-local status`。检测依据是实际运行的服务管理器，容器里仅安装了管理命令时不会注册或启动系统服务。没有运行服务管理器时，按脚本输出使用绝对路径前台启动，例如：
+
+```bash
+exec /opt/brume/brume --config /opt/brume/.brume/brume.conf
+```
+
+更新时，将新二进制另存为 `brume.new`，使用下面的命令并选择 `4`：
+
+```bash
+bash install-local.sh --binary ./brume.new
+```
+
+更新会校验本地程序、保留现有配置，并原子替换 `brume`。服务模式会安排独立进程重启；容器模式由外部管理器重启。事务目录及 `modify.log.*`、`upgrade.log.*` 都保存在本地 `.brume` 目录中。安装后应保持目录位置不变，因为服务使用绝对路径；同一主机仅管理一份 `brume-local` 安装，另一目录运行时会拒绝接管现有服务。卸载保留安装脚本、另存的新二进制和历史日志。
+
 ## 配置文件
 
 使用 `--config` 读取 `.conf` 文件。例如：
