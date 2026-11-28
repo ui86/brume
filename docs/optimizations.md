@@ -44,7 +44,7 @@ python3 tests/performance.py /绝对路径/优化前 /绝对路径/优化后 --m
 | 8 个关联，4 包/批 | 包数/秒 | 21577 | 21981 |
 | 同上 | 代理 CPU 时间 | 0.67 s | 0.47 s |
 
-单关联吞吐提高约 12%，两个负载下 CPU 均减少约 30%。多关联吞吐主要受 Python 回显端和负载生成器限制，只能确认 CPU 收益。单个回显套接字下 8 个关联各突发 16 包的探索测试出现接收超时，未产生有效对照，因此不作为性能结果；后续采用上述可完整收发的负载。脚本逐包核对内容，超时会使整个测试失败。
+单关联吞吐提高约 12%，两个负载下 CPU 均减少约 30%。该基准同时包含 Python 回显端和负载生成器的开销，多关联吞吐只小幅变化，本项主要依据 CPU 收益保留。单个回显套接字下 8 个关联各突发 16 包的探索测试出现接收超时，未产生有效对照，因此不作为性能结果；后续采用上述可完整收发的负载。脚本逐包核对内容，超时会使整个测试失败。
 
 原有 25 项 UDP 相关测试及新增直接发送的空数据报、停止流和关闭关联回归通过。原始数据见[单关联](benchmarks/udp-fast-comparison.json)和[多关联](benchmarks/udp-fast-concurrent.json)。
 
@@ -119,3 +119,29 @@ python3 tests/performance.py /绝对路径/优化前 /绝对路径/优化后 --m
 初次五轮对照的 CPU 时间同样降低：大流量 0.62 → 0.56 秒，小报文 0.10 → 0.06 秒。CPU 收益可重复，因此保留；吞吐变化约在 ±2% 内，没有稳定的吞吐提升，最终小报文 p99 略升，不能宣称延迟全面改善。该取舍适用于开启空闲超时且希望降低 CPU 开销的负载。
 
 TCP 相关回归及新增写入阻塞超时测试通过。原始数据：[初次大流量](benchmarks/timer-bulk.json)、[初次小报文](benchmarks/timer-small.json)、[最终大流量](benchmarks/timer-bulk-final.json)、[最终小报文](benchmarks/timer-small-final.json)。
+
+## 最终验证及版本对应
+
+本轮保留 6 项性能改动，HTTP 分散写因没有稳定收益回退。各项分别提交，提交作者和提交者均为 Guccen，新增代码注释使用中文。
+
+| 数据中的程序名称 | 对应版本 |
+| --- | --- |
+| baseline | `5972eed` |
+| http-pool | `a765d36` |
+| udp-fast | `f6c8381` |
+| udp-pool | `8f8ca27` |
+| tcp-shrink | `94bef24` |
+| dns-cache | `c3fd730` |
+| http-vectored | 已回退的分散写试验，记录提交为 `4344348` |
+| tcp-timer | `2019c68` |
+
+网络对照每项使用前一项已保留版本作为基线，收益不可相加；DNS 基准直接在同一构建中对照旧换代逻辑与新逻辑。原始 JSON 中的程序名按上表对应。
+
+最终检查全部通过：
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `cargo test --locked --all-targets`：91 项单元测试、1 项命令行集成测试。
+- `python3 tests/linux_resources.py /绝对路径/最终优化版`：真实描述符耗尽、退避、已有连接、恢复及关闭。
+- `cargo check --locked --all-targets --all-features --target x86_64-pc-windows-gnu`：Windows 交叉编译检查；没有在 Windows 上运行性能基准。
+- 基准脚本语法、所有原始 JSON 数据及 Git 差异空白校验。
