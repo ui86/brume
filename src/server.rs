@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -35,6 +35,7 @@ const UDP_CLIENT_ADDRESS_MISMATCH: &str = "UDP client address differs from the c
 static NEXT_UDP_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
 type Associations = Arc<Mutex<AssociationRegistry>>;
+type TcpActivity = Arc<Mutex<tokio::time::Instant>>;
 
 #[derive(Default)]
 struct AssociationRegistry {
@@ -567,24 +568,27 @@ where
         )
         .map(|_| ()),
         Some(idle_timeout) => {
-            let (activity, activity_rx) = watch::channel(tokio::time::Instant::now());
+            let activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
             let c2r = copy_direction(&mut client_r, &mut remote_w, Some(&activity));
             let r2c = copy_direction(&mut remote_r, &mut client_w, Some(&activity));
             let transfer = async { tokio::try_join!(c2r, r2c).map(|_| ()) };
-            with_tcp_idle_timeout(transfer, activity_rx, idle_timeout).await
+            with_tcp_idle_timeout(transfer, Arc::clone(&activity), idle_timeout).await
         }
     }
 }
 
 async fn with_tcp_idle_timeout(
     transfer: impl Future<Output = io::Result<()>>,
-    mut activity: watch::Receiver<tokio::time::Instant>,
+    activity: TcpActivity,
     idle_timeout: Duration,
 ) -> io::Result<()> {
     tokio::pin!(transfer);
+    let timer = tokio::time::sleep_until(tokio::time::Instant::now());
+    tokio::pin!(timer);
     loop {
         let deadline = activity
-            .borrow_and_update()
+            .lock()
+            .unwrap()
             .checked_add(idle_timeout)
             .ok_or_else(|| {
                 io::Error::new(
@@ -592,17 +596,13 @@ async fn with_tcp_idle_timeout(
                     "TCP timeout exceeds clock range",
                 )
             })?;
+        timer.as_mut().reset(deadline);
         tokio::select! {
             result = &mut transfer => return result,
-            _ = tokio::time::sleep_until(deadline) => {
-                if tokio::time::Instant::now().duration_since(*activity.borrow()) >= idle_timeout {
+            _ = &mut timer => {
+                // 仅在原截止时间到达时检查最近活动，避免每个数据块通知并重建等待。
+                if tokio::time::Instant::now().duration_since(*activity.lock().unwrap()) >= idle_timeout {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP idle timeout"));
-                }
-            }
-            changed = activity.changed() => {
-                if changed.is_err() {
-                    // 连接对象已释放，此时转发已完成或将返回错误。
-                    return transfer.await;
                 }
             }
         }
@@ -612,7 +612,7 @@ async fn with_tcp_idle_timeout(
 async fn copy_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
-    activity: Option<&watch::Sender<tokio::time::Instant>>,
+    activity: Option<&TcpActivity>,
 ) -> io::Result<u64>
 where
     R: AsyncReadExt + Unpin,
@@ -640,7 +640,7 @@ where
         }
         writer.write_all(&buffer[..n]).await?;
         if let Some(activity) = activity {
-            activity.send_replace(tokio::time::Instant::now());
+            *activity.lock().unwrap() = tokio::time::Instant::now();
         }
         total += n as u64;
         if n == buffer.len() && buffer.len() < MAX_TCP_BUFFER_SIZE {
@@ -1455,6 +1455,26 @@ mod tests {
         let preferred = association.preferred_addresses.lock().unwrap();
         assert_eq!(preferred.len(), MAX_FLOWS_PER_ASSOCIATION);
         assert!(!preferred.contains_key(&target));
+    }
+
+    #[tokio::test]
+    async fn tcp_idle_timeout_still_bounds_blocked_writes() {
+        let (mut writer, _unread_peer) = tokio::io::duplex(1);
+        let mut payload = b"blocked data".as_slice();
+        let activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let transfer = async {
+            copy_direction(&mut payload, &mut writer, Some(&activity))
+                .await
+                .map(|_| ())
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            with_tcp_idle_timeout(transfer, Arc::clone(&activity), Duration::from_millis(50)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]

@@ -1,0 +1,96 @@
+{
+  "parameters": {
+    "binaries": [
+      "dns-cache",
+      "tcp-timer"
+    ],
+    "mode": "tcp",
+    "flows": 256,
+    "batch": 1,
+    "rounds": 5,
+    "requests": 3000,
+    "concurrency": 1,
+    "size": 1024,
+    "timeout": 60
+  },
+  "medians": {
+    "dns-cache": {
+      "mib_per_second": 9.100847641359863,
+      "mean_us": 107.03777351106207,
+      "p99_us": 247.31969460844994,
+      "proxy_cpu_seconds": 0.1
+    },
+    "tcp-timer": {
+      "mib_per_second": 9.227060546860692,
+      "mean_us": 105.59008130803704,
+      "p99_us": 266.0793252289295,
+      "proxy_cpu_seconds": 0.06
+    }
+  },
+  "samples": {
+    "dns-cache": [
+      {
+        "mib_per_second": 4.451729952907698,
+        "mean_us": 219.0668306623896,
+        "p99_us": 951.1592797935009,
+        "proxy_cpu_seconds": 0.11
+      },
+      {
+        "mib_per_second": 10.021677622503175,
+        "mean_us": 97.21920639276505,
+        "p99_us": 229.83970120549202,
+        "proxy_cpu_seconds": 0.1
+      },
+      {
+        "mib_per_second": 8.646728906178272,
+        "mean_us": 112.69512974346678,
+        "p99_us": 247.31969460844994,
+        "proxy_cpu_seconds": 0.11
+      },
+      {
+        "mib_per_second": 9.100847641359863,
+        "mean_us": 107.03777351106207,
+        "p99_us": 391.7599096894264,
+        "proxy_cpu_seconds": 0.09
+      },
+      {
+        "mib_per_second": 9.930654096044323,
+        "mean_us": 98.10532908886671,
+        "p99_us": 246.40001356601715,
+        "proxy_cpu_seconds": 0.1
+      }
+    ],
+    "tcp-timer": [
+      {
+        "mib_per_second": 9.227060546860692,
+        "mean_us": 105.59008130803704,
+        "p99_us": 315.59960916638374,
+        "proxy_cpu_seconds": 0.06
+      },
+      {
+        "mib_per_second": 10.186526868405295,
+        "mean_us": 95.6446925799052,
+        "p99_us": 256.27994909882545,
+        "proxy_cpu_seconds": 0.06
+      },
+      {
+        "mib_per_second": 8.658468758544045,
+        "mean_us": 112.52570586899917,
+        "p99_us": 266.0793252289295,
+        "proxy_cpu_seconds": 0.07
+      },
+      {
+        "mib_per_second": 9.191487322094991,
+        "mean_us": 105.99708448474605,
+        "p99_us": 290.6401641666889,
+        "proxy_cpu_seconds": 0.06
+      },
+      {
+        "mib_per_second": 10.218091590059096,
+        "mean_us": 95.34752694889903,
+        "p99_us": 258.720014244318,
+        "proxy_cpu_seconds": 0.06
+      }
+    ]
+  }
+}

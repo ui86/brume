@@ -1,4 +1,6 @@
-use super::{HANDSHAKE_TIMEOUT, constant_time_eq, forward_bidirectional, with_tcp_idle_timeout};
+use super::{
+    HANDSHAKE_TIMEOUT, TcpActivity, constant_time_eq, forward_bidirectional, with_tcp_idle_timeout,
+};
 use crate::config::Config;
 use crate::dns::DnsResolver;
 use crate::protocol::{Host, Target};
@@ -17,11 +19,11 @@ use std::convert::Infallible;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 mod pool;
@@ -65,10 +67,10 @@ pub(super) async fn serve(
     http.timer(TokioTimer::new())
         .header_read_timeout(HANDSHAKE_TIMEOUT)
         .max_buf_size(MAX_HTTP_BUFFER_SIZE);
-    let (activity, activity_rx) = watch::channel(Instant::now());
+    let activity = Arc::new(Mutex::new(Instant::now()));
     let io = ClientIo {
         stream,
-        activity: config.tcp_timeout.map(|_| activity),
+        activity: config.tcp_timeout.map(|_| Arc::clone(&activity)),
     };
     let connection = async {
         http.serve_connection(TokioIo::new(io), service)
@@ -77,7 +79,7 @@ pub(super) async fn serve(
             .map_err(io::Error::other)
     };
     if let Some(timeout) = config.tcp_timeout {
-        with_tcp_idle_timeout(connection, activity_rx, timeout).await?;
+        with_tcp_idle_timeout(connection, activity, timeout).await?;
     } else {
         connection.await?;
     }
@@ -287,7 +289,7 @@ fn append_via(headers: &mut HeaderMap, version: Version) {
 
 struct ClientIo {
     stream: TcpStream,
-    activity: Option<watch::Sender<Instant>>,
+    activity: Option<TcpActivity>,
 }
 
 impl AsyncRead for ClientIo {
@@ -302,7 +304,7 @@ impl AsyncRead for ClientIo {
             && buf.filled().len() > before
             && let Some(activity) = &self.activity
         {
-            activity.send_replace(Instant::now());
+            *activity.lock().unwrap() = Instant::now();
         }
         result
     }
@@ -318,7 +320,7 @@ impl AsyncWrite for ClientIo {
         if matches!(result, Poll::Ready(Ok(n)) if n > 0)
             && let Some(activity) = &self.activity
         {
-            activity.send_replace(Instant::now());
+            *activity.lock().unwrap() = Instant::now();
         }
         result
     }

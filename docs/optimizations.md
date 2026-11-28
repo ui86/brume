@@ -95,3 +95,27 @@ python3 tests/performance.py /绝对路径/优化前 /绝对路径/试验版 --c
 ```
 
 五轮中位数：1 MiB 响应吞吐 707.66 → 716.39 次/秒（约 +1.2%），CPU 0.21 → 0.20 秒，差值仅一个计时刻度，且逐轮吞吐波动大于该变化。16 路 1 KiB 响应吞吐 9624 → 9529 次/秒（约 -1.0%），p99 为 4.10 → 4.24 ms。现有数据不足以证明净收益，不保留额外代码。原始数据见[大响应](benchmarks/vectored-bulk.json)和[小响应](benchmarks/vectored-small.json)。
+
+## 7. TCP 空闲超时通知：按 CPU 收益保留
+
+将每块转发数据的 watch 通知改为记录活动时间，复用单个定时器，在原期限到达时复查最近活动并续期。保持双向共享空闲期限，以及写入阻塞、单向传输和半关闭语义。只有启用 TCP 空闲超时的连接使用该路径。
+
+```bash
+python3 tests/performance.py /绝对路径/优化前 /绝对路径/优化后 --mode tcp --size 1048576 --requests 100 --concurrency 8 --timeout 60
+python3 tests/performance.py /绝对路径/优化前 /绝对路径/优化后 --mode tcp --requests 3000 --timeout 60
+```
+
+补充截止时间溢出保护后重新构建并执行最终五轮对照：
+
+| 负载 | 指标 | 优化前 | 优化后 |
+| --- | --- | ---: | ---: |
+| 8 条连接，1 MiB/次，共回显 800 MiB | CPU 时间 | 0.61 s | 0.56 s |
+| 同上 | 负载吞吐 | 538.33 MiB/s | 527.24 MiB/s |
+| 同上 | p99 | 25.15 ms | 25.37 ms |
+| 单连接，1 KiB/次，共 3000 次 | CPU 时间 | 0.10 s | 0.06 s |
+| 同上 | 平均往返耗时 | 107.04 μs | 105.59 μs |
+| 同上 | p99 | 247.32 μs | 266.08 μs |
+
+初次五轮对照的 CPU 时间同样降低：大流量 0.62 → 0.56 秒，小报文 0.10 → 0.06 秒。CPU 收益可重复，因此保留；吞吐变化约在 ±2% 内，没有稳定的吞吐提升，最终小报文 p99 略升，不能宣称延迟全面改善。该取舍适用于开启空闲超时且希望降低 CPU 开销的负载。
+
+TCP 相关回归及新增写入阻塞超时测试通过。原始数据：[初次大流量](benchmarks/timer-bulk.json)、[初次小报文](benchmarks/timer-small.json)、[最终大流量](benchmarks/timer-bulk-final.json)、[最终小报文](benchmarks/timer-small-final.json)。
