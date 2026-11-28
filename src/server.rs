@@ -30,6 +30,7 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const UDP_DNS_FALLBACK_GRACE: Duration = Duration::from_millis(50);
 const INITIAL_TCP_BUFFER_SIZE: usize = 8192;
 const MAX_TCP_BUFFER_SIZE: usize = 65536;
+const TCP_BUFFER_IDLE: Duration = Duration::from_secs(1);
 const UDP_CLIENT_ADDRESS_MISMATCH: &str = "UDP client address differs from the control connection";
 static NEXT_UDP_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -621,7 +622,18 @@ where
     let mut buffer = vec![0u8; INITIAL_TCP_BUFFER_SIZE];
     let mut total = 0u64;
     loop {
-        let n = reader.read(&mut buffer).await?;
+        let n = if buffer.len() > INITIAL_TCP_BUFFER_SIZE {
+            match tokio::time::timeout(TCP_BUFFER_IDLE, reader.read(&mut buffer)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    // 大流量结束后回收扩容缓冲，后续数据仍可按需增长。
+                    buffer = vec![0; INITIAL_TCP_BUFFER_SIZE];
+                    continue;
+                }
+            }
+        } else {
+            reader.read(&mut buffer).await?
+        };
         if n == 0 {
             writer.shutdown().await?;
             break;

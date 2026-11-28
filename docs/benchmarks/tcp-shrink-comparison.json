@@ -1,0 +1,96 @@
+{
+  "parameters": {
+    "binaries": [
+      "udp-pool",
+      "tcp-shrink"
+    ],
+    "mode": "tcp-memory",
+    "flows": 256,
+    "batch": 1,
+    "rounds": 5,
+    "requests": 1000,
+    "concurrency": 1,
+    "size": 1024,
+    "timeout": 0
+  },
+  "medians": {
+    "udp-pool": {
+      "rss_before_kib": 8964,
+      "rss_after_kib": 41820,
+      "transfer_seconds": 0.5154074742458761,
+      "proxy_cpu_seconds": 0.22
+    },
+    "tcp-shrink": {
+      "rss_before_kib": 8960,
+      "rss_after_kib": 25084,
+      "transfer_seconds": 0.47853111708536744,
+      "proxy_cpu_seconds": 0.23
+    }
+  },
+  "samples": {
+    "udp-pool": [
+      {
+        "rss_before_kib": 8964,
+        "rss_after_kib": 41804,
+        "transfer_seconds": 0.5154074742458761,
+        "proxy_cpu_seconds": 0.22
+      },
+      {
+        "rss_before_kib": 8964,
+        "rss_after_kib": 41820,
+        "transfer_seconds": 0.5335412202402949,
+        "proxy_cpu_seconds": 0.24000000000000002
+      },
+      {
+        "rss_before_kib": 8964,
+        "rss_after_kib": 41820,
+        "transfer_seconds": 0.5198959140107036,
+        "proxy_cpu_seconds": 0.24000000000000002
+      },
+      {
+        "rss_before_kib": 8964,
+        "rss_after_kib": 41804,
+        "transfer_seconds": 0.4946973002515733,
+        "proxy_cpu_seconds": 0.22
+      },
+      {
+        "rss_before_kib": 8964,
+        "rss_after_kib": 41836,
+        "transfer_seconds": 0.4846687098033726,
+        "proxy_cpu_seconds": 0.22
+      }
+    ],
+    "tcp-shrink": [
+      {
+        "rss_before_kib": 8968,
+        "rss_after_kib": 25948,
+        "transfer_seconds": 0.47125223698094487,
+        "proxy_cpu_seconds": 0.23
+      },
+      {
+        "rss_before_kib": 8960,
+        "rss_after_kib": 26724,
+        "transfer_seconds": 0.5236227880232036,
+        "proxy_cpu_seconds": 0.24000000000000002
+      },
+      {
+        "rss_before_kib": 8964,
+        "rss_after_kib": 24256,
+        "transfer_seconds": 0.48362850910052657,
+        "proxy_cpu_seconds": 0.21
+      },
+      {
+        "rss_before_kib": 8960,
+        "rss_after_kib": 25084,
+        "transfer_seconds": 0.45851441379636526,
+        "proxy_cpu_seconds": 0.23
+      },
+      {
+        "rss_before_kib": 8960,
+        "rss_after_kib": 24620,
+        "transfer_seconds": 0.47853111708536744,
+        "proxy_cpu_seconds": 0.23
+      }
+    ]
+  }
+}

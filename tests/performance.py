@@ -223,13 +223,55 @@ async def udp_memory_sample(binary, args):
         transport.close()
 
 
+async def tcp_memory_sample(binary, args):
+    async def echo(reader, writer):
+        try:
+            while data := await reader.read(65536):
+                writer.write(data)
+                await writer.drain()
+        except ConnectionError:
+            pass
+        finally:
+            writer.close()
+    async with await asyncio.start_server(echo, "127.0.0.1", 0) as upstream:
+        destination = upstream.sockets[0].getsockname()[1]
+        async with proxy(binary, args.timeout) as (port, process):
+            connections = [await socks(port, 1, destination) for _ in range(args.flows)]
+            try:
+                await asyncio.sleep(0.1)
+                before = rss_kib(process.pid)
+                payload = b"X" * (1024 * 1024)
+                gate = asyncio.Semaphore(16)
+                async def burst(reader, writer):
+                    async with gate:
+                        writer.write(payload)
+                        await asyncio.gather(writer.drain(), reader.readexactly(len(payload)))
+                before_cpu = process_cpu(process.pid)
+                started = time.perf_counter()
+                await asyncio.gather(*(burst(*connection) for connection in connections))
+                transfer = time.perf_counter() - started
+                cpu = process_cpu(process.pid) - before_cpu
+                await asyncio.sleep(2)
+                idle = rss_kib(process.pid)
+                for reader, writer in connections:
+                    writer.write(b"resume")
+                    await writer.drain()
+                    assert await reader.readexactly(6) == b"resume"
+                return {"rss_before_kib": before, "rss_after_kib": idle,
+                        "transfer_seconds": transfer, "proxy_cpu_seconds": cpu}
+            finally:
+                for _, writer in connections:
+                    writer.close()
+                await asyncio.gather(*(writer.wait_closed() for _, writer in connections))
+
+
 async def main(args):
     results = {binary: [] for binary in args.binaries}
     for round_index in range(args.rounds):
         # 交替执行次序，降低机器状态随时间变化带来的偏差。
         order = args.binaries if round_index % 2 == 0 else list(reversed(args.binaries))
         for binary in order:
-            action = {"http": http_sample, "udp": udp_sample, "udp-memory": udp_memory_sample}[args.mode]
+            action = {"http": http_sample, "udp": udp_sample, "udp-memory": udp_memory_sample, "tcp-memory": tcp_memory_sample}[args.mode]
             sample = await asyncio.wait_for(action(binary, args), 60)
             results[binary].append(sample)
     medians = {
@@ -242,7 +284,7 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binaries", nargs="+", help="待比较的代理程序绝对路径")
-    parser.add_argument("--mode", choices=["http", "udp", "udp-memory"], default="http")
+    parser.add_argument("--mode", choices=["http", "udp", "udp-memory", "tcp-memory"], default="http")
     parser.add_argument("--flows", type=int, default=256, help="内存基准的流数")
     parser.add_argument("--batch", type=int, default=1, help="每批 UDP 包数")
     parser.add_argument("--rounds", type=int, default=5)
