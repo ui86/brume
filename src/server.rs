@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 mod http_proxy;
+mod udp_buffer;
+use udp_buffer::{BufferLease, BufferPool};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_BUFFER_SIZE: usize = 65_535;
@@ -112,6 +114,7 @@ impl Association {
 
 struct Flow {
     socket: Arc<tokio::net::UdpSocket>,
+    buffers: Arc<BufferPool>,
     last_activity: Mutex<Instant>,
     active: AtomicBool,
     stopped: CancellationToken,
@@ -129,6 +132,7 @@ struct FlowSlot {
 struct UdpFlows {
     slots: Arc<Semaphore>,
     tasks: TaskTracker,
+    buffers: Arc<BufferPool>,
 }
 
 fn normalize(ip: IpAddr) -> IpAddr {
@@ -733,6 +737,7 @@ async fn udp_loop(
     let flows = Arc::new(UdpFlows {
         slots: Arc::new(Semaphore::new(MAX_UDP_FLOWS)),
         tasks: TaskTracker::new(),
+        buffers: BufferPool::new(),
     });
     let mut packets = JoinSet::new();
     let result = loop {
@@ -931,6 +936,7 @@ async fn handle_udp_packet(
                 remember_udp_address(association, &target, destination, slot.id);
                 let flow = Arc::new(Flow {
                     socket: Arc::new(socket),
+                    buffers: Arc::clone(&flow_workers.buffers),
                     last_activity: Mutex::new(Instant::now()),
                     active: AtomicBool::new(true),
                     stopped: CancellationToken::new(),
@@ -1010,8 +1016,6 @@ async fn receive_remote(
     destination: SocketAddr,
     timeout: Duration,
 ) {
-    // 无回复的 UDP 流不预分配最大报文缓冲，收到就绪通知后再申请。
-    let mut buffer = Vec::new();
     let mut pending_lookup = flow.pending_lookup.lock().unwrap().take();
     let mut received_reply = false;
     let mut failed = false;
@@ -1041,7 +1045,7 @@ async fn receive_remote(
                     pending_lookup = None;
                     continue;
                 }
-                result = receive_udp_payload(&flow.socket, &mut buffer) => result,
+                result = receive_udp_payload(&flow.socket, &flow.buffers) => result,
             }
         } else {
             tokio::select! {
@@ -1054,12 +1058,13 @@ async fn receive_remote(
                     pending_lookup = None;
                     continue;
                 }
-                result = receive_udp_payload(&flow.socket, &mut buffer) => result,
+                result = receive_udp_payload(&flow.socket, &flow.buffers) => result,
             }
         };
 
         match received {
-            Ok(length) => {
+            Ok((mut lease, length)) => {
+                let buffer = &mut lease.buffer;
                 if !association.alive.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1110,16 +1115,15 @@ async fn receive_remote(
 
 async fn receive_udp_payload(
     socket: &tokio::net::UdpSocket,
-    buffer: &mut Vec<u8>,
-) -> io::Result<usize> {
+    pool: &Arc<BufferPool>,
+) -> io::Result<(BufferLease, usize)> {
     loop {
         socket.readable().await?;
-        if buffer.is_empty() {
-            buffer.resize(UDP_BUFFER_SIZE, 0);
-        }
-        match socket.try_recv(&mut buffer[22..]) {
+        // 仅在套接字可读时借用缓冲，发送完成后归还，空闲流不独占内存。
+        let mut lease = pool.acquire().await;
+        match socket.try_recv(&mut lease.buffer[22..]) {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            result => return result,
+            result => return result.map(|length| (lease, length)),
         }
     }
 }
@@ -1393,30 +1397,30 @@ mod tests {
     async fn udp_reply_buffer_is_lazy_and_keeps_large_datagrams() {
         let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut buffer = Vec::new();
+        let pool = BufferPool::new();
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(30),
-                receive_udp_payload(&receiver, &mut buffer)
+                receive_udp_payload(&receiver, &pool)
             )
             .await
             .is_err()
         );
-        assert_eq!(buffer.capacity(), 0);
+        assert_eq!(Arc::strong_count(&pool), 1);
         let payload = vec![42; 60_000];
         sender
             .send_to(&payload, receiver.local_addr().unwrap())
             .await
             .unwrap();
-        let length = tokio::time::timeout(
+        let (lease, length) = tokio::time::timeout(
             Duration::from_secs(1),
-            receive_udp_payload(&receiver, &mut buffer),
+            receive_udp_payload(&receiver, &pool),
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(length, payload.len());
-        assert_eq!(&buffer[22..22 + length], payload);
+        assert_eq!(&lease.buffer[22..22 + length], payload);
     }
 
     #[tokio::test]
@@ -1697,6 +1701,7 @@ mod tests {
         socket.connect(destination).await.unwrap();
         let flow = Arc::new(Flow {
             socket: Arc::new(socket),
+            buffers: BufferPool::new(),
             last_activity: Mutex::new(Instant::now()),
             active: AtomicBool::new(true),
             stopped: CancellationToken::new(),

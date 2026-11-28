@@ -181,13 +181,55 @@ async def udp_sample(binary, args):
         transport.close()
 
 
+def rss_kib(pid):
+    with open(f"/proc/{pid}/status", encoding="utf-8") as source:
+        return int(next(line for line in source if line.startswith("VmRSS:")).split()[1])
+
+
+async def udp_memory_sample(binary, args):
+    class Echo(asyncio.DatagramProtocol):
+        def connection_made(self, transport):
+            self.transport = transport
+        def datagram_received(self, data, addr):
+            self.transport.sendto(data, addr)
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(Echo, local_addr=("127.0.0.1", 0))
+    destination = transport.get_extra_info("sockname")[1]
+    sockets, controls = [], []
+    try:
+        async with proxy(binary, args.timeout) as (port, process):
+            for _ in range(args.flows):
+                udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp.setblocking(False)
+                udp.bind(("127.0.0.1", 0))
+                udp.connect(("127.0.0.1", port))
+                sockets.append(udp)
+                controls.append(await socks(port, 3, udp.getsockname()[1]))
+            await asyncio.sleep(0.1)
+            before = rss_kib(process.pid)
+            packet = bytes([0, 0, 0, 1, 127, 0, 0, 1]) + struct.pack("!H", destination) + b"X"
+            for udp in sockets:
+                await loop.sock_sendall(udp, packet)
+                assert await asyncio.wait_for(loop.sock_recv(udp, 65535), 2) == packet
+            await asyncio.sleep(1)
+            after = rss_kib(process.pid)
+            return {"rss_before_kib": before, "rss_after_kib": after, "rss_growth_kib": after - before}
+    finally:
+        for udp in sockets:
+            udp.close()
+        for _, writer in controls:
+            writer.close()
+        await asyncio.gather(*(writer.wait_closed() for _, writer in controls), return_exceptions=True)
+        transport.close()
+
+
 async def main(args):
     results = {binary: [] for binary in args.binaries}
     for round_index in range(args.rounds):
         # 交替执行次序，降低机器状态随时间变化带来的偏差。
         order = args.binaries if round_index % 2 == 0 else list(reversed(args.binaries))
         for binary in order:
-            action = http_sample if args.mode == "http" else udp_sample
+            action = {"http": http_sample, "udp": udp_sample, "udp-memory": udp_memory_sample}[args.mode]
             sample = await asyncio.wait_for(action(binary, args), 60)
             results[binary].append(sample)
     medians = {
@@ -200,7 +242,8 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binaries", nargs="+", help="待比较的代理程序绝对路径")
-    parser.add_argument("--mode", choices=["http", "udp"], default="http")
+    parser.add_argument("--mode", choices=["http", "udp", "udp-memory"], default="http")
+    parser.add_argument("--flows", type=int, default=256, help="内存基准的流数")
     parser.add_argument("--batch", type=int, default=1, help="每批 UDP 包数")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--requests", type=int, default=1000, help="每条连接的请求次数")

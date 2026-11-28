@@ -1,0 +1,84 @@
+{
+  "parameters": {
+    "binaries": [
+      "udp-fast",
+      "udp-pool"
+    ],
+    "mode": "udp",
+    "flows": 256,
+    "batch": 16,
+    "rounds": 5,
+    "requests": 1000,
+    "concurrency": 1,
+    "size": 1024,
+    "timeout": 0
+  },
+  "medians": {
+    "udp-fast": {
+      "packets_per_second": 22104.784230077756,
+      "mean_us_per_packet": 45.20612058695406,
+      "proxy_cpu_seconds": 0.22
+    },
+    "udp-pool": {
+      "packets_per_second": 24103.274287087097,
+      "mean_us_per_packet": 41.45722961402498,
+      "proxy_cpu_seconds": 0.22
+    }
+  },
+  "samples": {
+    "udp-fast": [
+      {
+        "packets_per_second": 11180.935879125256,
+        "mean_us_per_packet": 89.40517681185156,
+        "proxy_cpu_seconds": 0.25
+      },
+      {
+        "packets_per_second": 24752.444435961763,
+        "mean_us_per_packet": 40.36660966812633,
+        "proxy_cpu_seconds": 0.21
+      },
+      {
+        "packets_per_second": 24876.89942048684,
+        "mean_us_per_packet": 40.16826534643769,
+        "proxy_cpu_seconds": 0.21
+      },
+      {
+        "packets_per_second": 22104.784230077756,
+        "mean_us_per_packet": 45.20612058695406,
+        "proxy_cpu_seconds": 0.22
+      },
+      {
+        "packets_per_second": 21134.649255670614,
+        "mean_us_per_packet": 47.27727043791674,
+        "proxy_cpu_seconds": 0.22
+      }
+    ],
+    "udp-pool": [
+      {
+        "packets_per_second": 23735.09678469041,
+        "mean_us_per_packet": 42.10107011022046,
+        "proxy_cpu_seconds": 0.22
+      },
+      {
+        "packets_per_second": 23694.763083852322,
+        "mean_us_per_packet": 42.17239108402282,
+        "proxy_cpu_seconds": 0.23
+      },
+      {
+        "packets_per_second": 24760.75822835717,
+        "mean_us_per_packet": 40.355625707888976,
+        "proxy_cpu_seconds": 0.22
+      },
+      {
+        "packets_per_second": 24103.274287087097,
+        "mean_us_per_packet": 41.45722961402498,
+        "proxy_cpu_seconds": 0.22
+      },
+      {
+        "packets_per_second": 24218.700443622303,
+        "mean_us_per_packet": 41.258870041929185,
+        "proxy_cpu_seconds": 0.22
+      }
+    ]
+  }
+}

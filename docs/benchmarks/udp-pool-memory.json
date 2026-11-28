@@ -1,0 +1,84 @@
+{
+  "parameters": {
+    "binaries": [
+      "udp-fast",
+      "udp-pool"
+    ],
+    "mode": "udp-memory",
+    "flows": 256,
+    "batch": 1,
+    "rounds": 5,
+    "requests": 1000,
+    "concurrency": 1,
+    "size": 1024,
+    "timeout": 0
+  },
+  "medians": {
+    "udp-fast": {
+      "rss_before_kib": 4796,
+      "rss_after_kib": 21884,
+      "rss_growth_kib": 17088
+    },
+    "udp-pool": {
+      "rss_before_kib": 4928,
+      "rss_after_kib": 5608,
+      "rss_growth_kib": 684
+    }
+  },
+  "samples": {
+    "udp-fast": [
+      {
+        "rss_before_kib": 4784,
+        "rss_after_kib": 21876,
+        "rss_growth_kib": 17092
+      },
+      {
+        "rss_before_kib": 4796,
+        "rss_after_kib": 21884,
+        "rss_growth_kib": 17088
+      },
+      {
+        "rss_before_kib": 4784,
+        "rss_after_kib": 21872,
+        "rss_growth_kib": 17088
+      },
+      {
+        "rss_before_kib": 4812,
+        "rss_after_kib": 21900,
+        "rss_growth_kib": 17088
+      },
+      {
+        "rss_before_kib": 4808,
+        "rss_after_kib": 21888,
+        "rss_growth_kib": 17080
+      }
+    ],
+    "udp-pool": [
+      {
+        "rss_before_kib": 4928,
+        "rss_after_kib": 5608,
+        "rss_growth_kib": 680
+      },
+      {
+        "rss_before_kib": 4928,
+        "rss_after_kib": 5612,
+        "rss_growth_kib": 684
+      },
+      {
+        "rss_before_kib": 4928,
+        "rss_after_kib": 5608,
+        "rss_growth_kib": 680
+      },
+      {
+        "rss_before_kib": 4924,
+        "rss_after_kib": 5660,
+        "rss_growth_kib": 736
+      },
+      {
+        "rss_before_kib": 4924,
+        "rss_after_kib": 5608,
+        "rss_growth_kib": 684
+      }
+    ]
+  }
+}
