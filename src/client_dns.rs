@@ -10,6 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod configuration;
 mod transport;
 use transport::DnsWorkers;
 
@@ -27,6 +28,8 @@ pub(crate) struct ResolverSnapshot {
     options: ResolverOpts,
     hosts: Arc<Hosts>,
     loaded_at: Instant,
+    checked_at: Instant,
+    hosts_source: Option<Arc<Vec<u8>>>,
     configuration_error: Option<Arc<io::Error>>,
 }
 
@@ -49,46 +52,91 @@ impl ResolverSnapshot {
             options,
             hosts,
             loaded_at: Instant::now(),
+            checked_at: Instant::now(),
+            hosts_source: None,
             configuration_error,
         }
     }
 }
 
 /// 客户端共享解析器，保留缓存，并定期重新读取系统 DNS 与 hosts 配置。
-#[derive(Default)]
 pub(crate) struct ClientDns {
-    snapshot: Mutex<Option<Arc<ResolverSnapshot>>>,
+    snapshot: Arc<Mutex<Option<Arc<ResolverSnapshot>>>>,
     workers: DnsWorkers,
+    refresh: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for ClientDns {
+    fn default() -> Self {
+        Self {
+            snapshot: Arc::default(),
+            workers: DnsWorkers::default(),
+            refresh: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
 }
 
 impl ClientDns {
-    fn configuration(&self) -> io::Result<Arc<ResolverSnapshot>> {
-        let mut snapshot = self
+    fn cached_configuration(&self) -> io::Result<Option<Arc<ResolverSnapshot>>> {
+        let snapshot = self
             .snapshot
             .lock()
             .map_err(|_| io::Error::other("客户端 DNS 配置锁已损坏"))?;
         if let Some(current) = snapshot.as_ref()
-            && current.loaded_at.elapsed() < SYSTEM_CONFIG_REFRESH
+            && current.checked_at.elapsed() < SYSTEM_CONFIG_REFRESH
         {
-            return Ok(Arc::clone(current));
+            return Ok(Some(Arc::clone(current)));
         }
-
-        // 只有本地系统配置与 hosts 文件读取是同步操作；网络查询使用可取消的异步套接字。
-        // 显式共享同一份 hosts 快照，单族命中时直接返回，避免等待另一族的上游查询。
-        let hosts = Arc::new(Hosts::from_system().unwrap_or_default());
-        let current = Arc::new(ResolverSnapshot::from_sources(
-            read_system_configuration(),
-            hosts,
-        ));
-        *snapshot = Some(Arc::clone(&current));
-        Ok(current)
+        Ok(None)
     }
 
-    fn lookup_source(&self, name: &str, port: u16) -> io::Result<LookupSource> {
+    async fn configuration(&self) -> io::Result<Arc<ResolverSnapshot>> {
+        if let Some(current) = self.cached_configuration()? {
+            return Ok(current);
+        }
+        let permit = Arc::clone(&self.refresh)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("客户端 DNS 配置刷新已关闭"))?;
+        if let Some(current) = self.cached_configuration()? {
+            return Ok(current);
+        }
+        let snapshot = Arc::clone(&self.snapshot);
+        tokio::task::spawn_blocking(move || {
+            // 查询取消后仍持有刷新许可，避免重复启动不可取消的文件读取任务。
+            let _permit = permit;
+            let (hosts, source) = configuration::read_hosts();
+            let mut current = ResolverSnapshot::from_sources(read_system_configuration(), hosts);
+            current.hosts_source = Some(Arc::new(source));
+            let mut snapshot = snapshot
+                .lock()
+                .map_err(|_| io::Error::other("客户端 DNS 配置锁已损坏"))?;
+            Ok(Self::replace_configuration(&mut snapshot, current))
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    fn replace_configuration(
+        snapshot: &mut Option<Arc<ResolverSnapshot>>,
+        mut current: ResolverSnapshot,
+    ) -> Arc<ResolverSnapshot> {
+        if let Some(previous) = snapshot.as_ref()
+            && previous.same_sources(&current)
+        {
+            // 检查时间只控制刷新频率，只有配置内容变化才使工作槽缓存失效。
+            current.loaded_at = previous.loaded_at;
+        }
+        let current = Arc::new(current);
+        *snapshot = Some(Arc::clone(&current));
+        current
+    }
+
+    async fn lookup_source(&self, name: &str, port: u16) -> io::Result<LookupSource> {
         if let Ok(ip) = name.parse::<IpAddr>() {
             return Ok(LookupSource::Local(vec![SocketAddr::new(ip, port)]));
         }
-        let snapshot = self.configuration()?;
+        let snapshot = self.configuration().await?;
         if let Ok(host_name) = name.parse::<Name>() {
             let local_addresses: Vec<_> = [RecordType::AAAA, RecordType::A]
                 .into_iter()
@@ -120,7 +168,7 @@ impl ClientDns {
         port: u16,
         preferred_ipv4: bool,
     ) -> io::Result<Vec<SocketAddr>> {
-        let snapshot = match self.lookup_source(name, port)? {
+        let snapshot = match self.lookup_source(name, port).await? {
             LookupSource::Local(addresses) => return Ok(addresses),
             LookupSource::Network(snapshot) => snapshot,
         };
@@ -170,7 +218,7 @@ impl ClientDns {
             return happy_eyeballs_connect(&[address], timeout).await;
         }
         let (name, port) = server_parts(server)?;
-        match self.lookup_source(name, port)? {
+        match self.lookup_source(name, port).await? {
             LookupSource::Local(addresses) => happy_eyeballs_connect(&addresses, timeout).await,
             LookupSource::Network(snapshot) => {
                 happy_eyeballs_connect_resolving(
@@ -208,8 +256,8 @@ impl ClientDns {
     #[cfg(test)]
     pub(crate) fn with_resolver(snapshot: ResolverSnapshot) -> Self {
         Self {
-            snapshot: Mutex::new(Some(Arc::new(snapshot))),
-            workers: DnsWorkers::default(),
+            snapshot: Arc::new(Mutex::new(Some(Arc::new(snapshot)))),
+            ..Self::default()
         }
     }
 }
@@ -268,6 +316,8 @@ pub(crate) mod tests {
             options,
             hosts: Arc::new(Hosts::default()),
             loaded_at: Instant::now(),
+            checked_at: Instant::now(),
+            hosts_source: Some(Arc::new(Vec::new())),
             configuration_error: None,
         }
     }
@@ -292,6 +342,111 @@ pub(crate) mod tests {
             response.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
         }
         (response, record_type)
+    }
+
+    async fn refresh_workload(preserve: bool, count: usize) -> (Duration, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let upstream_queries = Arc::clone(&queries);
+        let upstream = tokio::spawn(async move {
+            let mut packet = [0; 4096];
+            loop {
+                let (length, source) = socket.recv_from(&mut packet).await.unwrap();
+                upstream_queries.fetch_add(1, Ordering::Relaxed);
+                socket
+                    .send_to(&answer(&packet[..length]).0, source)
+                    .await
+                    .unwrap();
+            }
+        });
+        let initial = test_resolver(address);
+        let dns = ClientDns::with_resolver(initial.clone());
+        dns.lookup_remote_family(&initial, "refresh.example.", 1080, false)
+            .await
+            .unwrap();
+        let before = queries.load(Ordering::Relaxed);
+        let started = Instant::now();
+        for _ in 0..count {
+            let current = test_resolver(address);
+            let snapshot = if preserve {
+                ClientDns::replace_configuration(&mut dns.snapshot.lock().unwrap(), current)
+            } else {
+                // 对照旧刷新行为：每次加载都创建新代次，即使配置内容完全相同。
+                let current = Arc::new(current);
+                *dns.snapshot.lock().unwrap() = Some(Arc::clone(&current));
+                current
+            };
+            let addresses = dns
+                .lookup_remote_family(&snapshot, "refresh.example.", 1080, false)
+                .await
+                .unwrap();
+            assert_eq!(addresses, vec!["127.0.0.42:1080".parse().unwrap()]);
+        }
+        let elapsed = started.elapsed();
+        let requests = queries.load(Ordering::Relaxed) - before;
+        upstream.abort();
+        let _ = upstream.await;
+        (elapsed, requests)
+    }
+
+    #[tokio::test]
+    async fn unchanged_configuration_refresh_keeps_cached_dns_answers() {
+        assert_eq!(refresh_workload(true, 3).await.1, 0);
+        assert_eq!(refresh_workload(false, 3).await.1, 3);
+    }
+
+    #[test]
+    fn configuration_generation_tracks_content_instead_of_check_time() {
+        let original = test_resolver("127.0.0.1:53".parse().unwrap());
+        let mut snapshot = Some(Arc::new(original.clone()));
+        let identical = test_resolver("127.0.0.1:53".parse().unwrap());
+        let checked_at = identical.checked_at;
+        let refreshed = ClientDns::replace_configuration(&mut snapshot, identical);
+        assert_eq!(refreshed.loaded_at, original.loaded_at);
+        assert_eq!(refreshed.checked_at, checked_at);
+        let mut changes = Vec::new();
+        let mut changed = original.clone();
+        changed.config.name_servers[0].connections[0].port += 1;
+        changes.push(changed);
+        let mut changed = original.clone();
+        changed.options.timeout += Duration::from_secs(1);
+        changes.push(changed);
+        let mut changed = original.clone();
+        changed.hosts_source = Some(Arc::new(b"127.0.0.2 changed.example".to_vec()));
+        changes.push(changed);
+        let mut changed = original.clone();
+        changed.configuration_error =
+            Some(Arc::new(io::Error::from(io::ErrorKind::PermissionDenied)));
+        changes.push(changed);
+        for mut changed in changes {
+            changed.loaded_at = Instant::now();
+            snapshot = Some(Arc::new(original.clone()));
+            let refreshed = ClientDns::replace_configuration(&mut snapshot, changed);
+            assert_ne!(refreshed.loaded_at, original.loaded_at);
+        }
+    }
+
+    #[cfg(feature = "performance-bench")]
+    #[tokio::test]
+    #[ignore = "显式运行配置刷新前后的 DNS 缓存基准"]
+    async fn benchmark_dns_configuration_refresh() {
+        for round in 0..5 {
+            let order = if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            };
+            for preserve in order {
+                let (elapsed, queries) = refresh_workload(preserve, 1000).await;
+                assert_eq!(queries, if preserve { 0 } else { 1000 });
+                println!(
+                    "DNS_REFRESH round={round} preserve={preserve} ns_per_refresh={:.2} queries={queries}",
+                    elapsed.as_nanos() as f64 / 1000.0
+                );
+            }
+        }
     }
 
     #[tokio::test]

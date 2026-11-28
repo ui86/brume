@@ -1,0 +1,66 @@
+{
+  "iterations_per_round": 1000,
+  "note": "受控刷新配置并查询同一缓存域名，不包含系统文件读取；对照旧的无条件换代行为。",
+  "samples": [
+    {
+      "round": 0,
+      "preserve": false,
+      "ns_per_refresh": 55141.24,
+      "queries": 1000
+    },
+    {
+      "round": 0,
+      "preserve": true,
+      "ns_per_refresh": 2474.12,
+      "queries": 0
+    },
+    {
+      "round": 1,
+      "preserve": true,
+      "ns_per_refresh": 3272.56,
+      "queries": 0
+    },
+    {
+      "round": 1,
+      "preserve": false,
+      "ns_per_refresh": 63720.03,
+      "queries": 1000
+    },
+    {
+      "round": 2,
+      "preserve": false,
+      "ns_per_refresh": 59806.15,
+      "queries": 1000
+    },
+    {
+      "round": 2,
+      "preserve": true,
+      "ns_per_refresh": 2333.08,
+      "queries": 0
+    },
+    {
+      "round": 3,
+      "preserve": true,
+      "ns_per_refresh": 2311.64,
+      "queries": 0
+    },
+    {
+      "round": 3,
+      "preserve": false,
+      "ns_per_refresh": 53209.28,
+      "queries": 1000
+    },
+    {
+      "round": 4,
+      "preserve": false,
+      "ns_per_refresh": 52433.28,
+      "queries": 1000
+    },
+    {
+      "round": 4,
+      "preserve": true,
+      "ns_per_refresh": 2247.52,
+      "queries": 0
+    }
+  ]
+}
