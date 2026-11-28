@@ -17,30 +17,36 @@ use std::convert::Infallible;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
+
+mod pool;
+pub(super) use pool::ConnectionPool;
 
 const MAX_HTTP_BUFFER_SIZE: usize = 32 * 1024;
 type ProxyBody = UnsyncBoxBody<Bytes, hyper::Error>;
 type Tunnel = (hyper::upgrade::OnUpgrade, TcpStream);
 
-pub(super) async fn serve(stream: TcpStream, config: &Config, dns: &DnsResolver) -> io::Result<()> {
+pub(super) async fn serve(
+    stream: TcpStream,
+    config: &Config,
+    dns: &DnsResolver,
+    pool: &Arc<ConnectionPool>,
+) -> io::Result<()> {
     let credentials = (!config.username.is_empty() && !config.username.contains(':'))
         .then(|| STANDARD.encode(format!("{}:{}", config.username, config.password)));
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel(1);
-    let upstreams = CancellationToken::new();
-    let _stop_upstreams = upstreams.clone().drop_guard();
     let service = service_fn(|request| async {
         let response = if config.username.is_empty()
             || credentials
                 .as_deref()
                 .is_some_and(|expected| authorized(request.headers(), expected))
         {
-            match handle_request(request, dns, &tunnel_tx, &upstreams).await {
+            match handle_request(request, dns, &tunnel_tx, pool).await {
                 Ok(response) => response,
                 Err(status) => empty_response(status),
             }
@@ -94,7 +100,7 @@ async fn handle_request(
     mut request: Request<Incoming>,
     dns: &DnsResolver,
     tunnel: &mpsc::Sender<Tunnel>,
-    upstreams: &CancellationToken,
+    pool: &Arc<ConnectionPool>,
 ) -> Result<Response<ProxyBody>, StatusCode> {
     let connect = request.method() == Method::CONNECT;
     if request.headers().contains_key(UPGRADE) {
@@ -108,29 +114,21 @@ async fn handle_request(
         return Err(StatusCode::BAD_REQUEST);
     }
     let target = target(request.uri(), connect).ok_or(StatusCode::BAD_REQUEST)?;
-    let remote = dns
-        .connect_tcp(&target, HANDSHAKE_TIMEOUT)
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::TimedOut => StatusCode::GATEWAY_TIMEOUT,
-            _ => StatusCode::BAD_GATEWAY,
-        })?;
-    remote
-        .set_nodelay(true)
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
     if connect {
+        let remote = pool::connect(dns, &target).await?;
         tunnel
             .try_send((hyper::upgrade::on(&mut request), remote))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Ok(empty_response(StatusCode::OK));
     }
-    forward_request(request, remote, upstreams.clone()).await
+    forward_request(request, target, dns, pool).await
 }
 
 async fn forward_request(
     request: Request<Incoming>,
-    remote: TcpStream,
-    upstreams: CancellationToken,
+    target: Target,
+    dns: &DnsResolver,
+    pool: &Arc<ConnectionPool>,
 ) -> Result<Response<ProxyBody>, StatusCode> {
     let (mut parts, body) = request.into_parts();
     let authority = parts.uri.authority().ok_or(StatusCode::BAD_REQUEST)?;
@@ -147,28 +145,25 @@ async fn forward_request(
     // Hyper 在代理读取请求体时处理客户端的 100 Continue。
     parts.headers.remove(EXPECT);
     parts.headers.insert(HOST, host);
-    parts
-        .headers
-        .insert(CONNECTION, HeaderValue::from_static("close"));
     append_via(&mut parts.headers, parts.version);
     parts.version = Version::HTTP_11;
     let request = Request::from_parts(parts, relay_body(body, fields));
 
-    let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
-        .max_buf_size(MAX_HTTP_BUFFER_SIZE)
-        .handshake(TokioIo::new(remote))
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = upstreams.cancelled() => {}
-            _ = connection => {}
+    let mut connection = pool.acquire(&target, dns).await?;
+    let response = match connection.sender.try_send_request(request).await {
+        Ok(response) => response,
+        Err(mut error) => {
+            // 仅重试 Hyper 确认尚未序列化的请求，避免重复执行已发送的操作。
+            let request = error.take_message().ok_or(StatusCode::BAD_GATEWAY)?;
+            drop(connection);
+            connection = pool.acquire(&target, dns).await?;
+            connection
+                .sender
+                .send_request(request)
+                .await
+                .map_err(|_| StatusCode::BAD_GATEWAY)?
         }
-    });
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    };
     let (mut parts, body) = response.into_parts();
     if parts.status.is_informational() || !supported_transfer_encoding(&parts.headers) {
         return Err(StatusCode::BAD_GATEWAY);
@@ -176,7 +171,8 @@ async fn forward_request(
     let fields = connection_fields(&parts.headers);
     strip_hop_headers(&mut parts.headers, &fields);
     append_via(&mut parts.headers, parts.version);
-    Ok(Response::from_parts(parts, relay_body(body, fields)))
+    let body = pool.response_body(target, connection, relay_body(body, fields));
+    Ok(Response::from_parts(parts, body))
 }
 
 fn target(uri: &Uri, connect: bool) -> Option<Target> {

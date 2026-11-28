@@ -191,6 +191,11 @@ pub struct Server {
     shutdown: CancellationToken,
 }
 
+struct TcpServices {
+    dns: Arc<DnsResolver>,
+    http: Arc<http_proxy::ConnectionPool>,
+}
+
 impl Server {
     pub fn bind(config: Config, shutdown: CancellationToken) -> io::Result<Self> {
         config
@@ -249,6 +254,10 @@ impl Server {
         let _shutdown_guard = self.shutdown.clone().drop_guard();
         // 在服务运行时内创建解析器，复用已有工作线程
         let dns = Arc::new(DnsResolver::new(&self.config.dns_servers)?);
+        let services = Arc::new(TcpServices {
+            dns: Arc::clone(&dns),
+            http: http_proxy::ConnectionPool::new(self.shutdown.clone()),
+        });
         let tcp = tokio::net::TcpListener::from_std(self.tcp)?;
         // 直接消费 self.udp 转为 tokio 套接字，避免 try_clone 产生冗余句柄
         let udp = Arc::new(tokio::net::UdpSocket::from_std(self.udp)?);
@@ -295,7 +304,7 @@ impl Server {
                                 continue;
                             };
                             let config = Arc::clone(&self.config);
-                            let dns = Arc::clone(&dns);
+                            let services = Arc::clone(&services);
                             let associations = Arc::clone(&self.associations);
                             let udp = Arc::clone(&udp);
                             let shutdown = self.shutdown.clone();
@@ -303,7 +312,7 @@ impl Server {
                             clients.spawn(async move {
                                 let _permit = permit;
                                 if let Err(error) =
-                                    handle_client(stream, config, dns, udp, associations, id, shutdown).await
+                                    handle_client(stream, config, services, udp, associations, id, shutdown).await
                                     && should_log_client_error(&error)
                                 {
                                     eprintln!("Connection from {address} failed: {error}");
@@ -326,6 +335,7 @@ impl Server {
         // 通知所有子任务停止
         self.shutdown.cancel();
         clients.shutdown().await;
+        services.http.shutdown().await;
         stop_associations(&self.associations);
         let udp_result = match udp_result {
             Some(result) => result,
@@ -441,7 +451,7 @@ fn should_log_client_error(error: &io::Error) -> bool {
 async fn handle_client(
     mut stream: tokio::net::TcpStream,
     config: Arc<Config>,
-    dns: Arc<DnsResolver>,
+    services: Arc<TcpServices>,
     udp: Arc<tokio::net::UdpSocket>,
     associations: Associations,
     id: u64,
@@ -458,7 +468,7 @@ async fn handle_client(
         return Ok(());
     }
     if first[0] != 5 {
-        return http_proxy::serve(stream, &config, &dns).await;
+        return http_proxy::serve(stream, &config, &services.dns, &services.http).await;
     }
     tokio::time::timeout_at(deadline, negotiate(&mut stream, &config))
         .await
@@ -490,7 +500,9 @@ async fn handle_client(
         };
 
     match command {
-        protocol::CONNECT => connect(stream, target, config.tcp_timeout, &dns, shutdown).await,
+        protocol::CONNECT => {
+            connect(stream, target, config.tcp_timeout, &services.dns, shutdown).await
+        }
         protocol::UDP_ASSOCIATE => associate(stream, target, udp, associations, id, shutdown).await,
         _ => {
             let address = unspecified(stream.local_addr()?.ip());
@@ -1826,6 +1838,56 @@ mod tests {
         http.read_to_end(&mut payload).unwrap();
         assert_eq!(payload, b"prefetched tunnel bytes");
         echo.join().unwrap();
+        shutdown.cancel();
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn http_proxy_reuses_upstream_and_reconnects_after_close() {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = origin.local_addr().unwrap();
+        let origin_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = origin.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut stream = BufReader::new(stream);
+                for index in 0..3 {
+                    let head = read_http_head(&mut stream).to_ascii_lowercase();
+                    assert!(head.starts_with("get / http/1.1\r\n"));
+                    assert!(!head.contains("connection: close"));
+                    let connection = if index == 2 {
+                        "Connection: close\r\n"
+                    } else {
+                        ""
+                    };
+                    write!(
+                        stream.get_mut(),
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n{connection}\r\nOK"
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let (proxy, shutdown, server_thread) = start_server("", "", "127.0.0.1");
+        let client = TcpStream::connect(proxy).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut client = BufReader::new(client);
+        for _ in 0..6 {
+            write!(
+                client.get_mut(),
+                "GET http://{destination}/ HTTP/1.1\r\nHost: ignored\r\n\r\n"
+            )
+            .unwrap();
+            assert!(read_http_head(&mut client).starts_with("HTTP/1.1 200"));
+            let mut body = [0; 2];
+            client.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"OK");
+        }
+        origin_thread.join().unwrap();
         shutdown.cancel();
         server_thread.join().unwrap().unwrap();
     }

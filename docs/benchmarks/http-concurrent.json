@@ -1,0 +1,105 @@
+{
+  "parameters": {
+    "binaries": [
+      "baseline",
+      "http-pool"
+    ],
+    "rounds": 5,
+    "requests": 500,
+    "concurrency": 16,
+    "size": 1024,
+    "timeout": 0
+  },
+  "medians": {
+    "baseline": {
+      "requests_per_second": 6848.678990865602,
+      "mean_us": 2324.220507463906,
+      "p99_us": 5347.752012312412,
+      "proxy_cpu_seconds": 0.58,
+      "upstream_connections": 8000
+    },
+    "http-pool": {
+      "requests_per_second": 9678.890996259037,
+      "mean_us": 1633.359363535419,
+      "p99_us": 4183.794371783733,
+      "proxy_cpu_seconds": 0.43,
+      "upstream_connections": 2808
+    }
+  },
+  "samples": {
+    "baseline": [
+      {
+        "requests_per_second": 4416.810755931127,
+        "mean_us": 3602.0446242182516,
+        "p99_us": 8150.067646056414,
+        "proxy_cpu_seconds": 0.64,
+        "upstream_connections": 8000
+      },
+      {
+        "requests_per_second": 6848.678990865602,
+        "mean_us": 2324.220507463906,
+        "p99_us": 5347.752012312412,
+        "proxy_cpu_seconds": 0.56,
+        "upstream_connections": 8000
+      },
+      {
+        "requests_per_second": 6694.771076572738,
+        "mean_us": 2378.4631071030162,
+        "p99_us": 5520.67207172513,
+        "proxy_cpu_seconds": 0.62,
+        "upstream_connections": 8000
+      },
+      {
+        "requests_per_second": 7110.74331796624,
+        "mean_us": 2239.1185162123293,
+        "p99_us": 5195.112898945808,
+        "proxy_cpu_seconds": 0.58,
+        "upstream_connections": 8000
+      },
+      {
+        "requests_per_second": 7013.459754757514,
+        "mean_us": 2270.129323238507,
+        "p99_us": 4952.313378453255,
+        "proxy_cpu_seconds": 0.57,
+        "upstream_connections": 8000
+      }
+    ],
+    "http-pool": [
+      {
+        "requests_per_second": 9722.588611413554,
+        "mean_us": 1630.8063861215487,
+        "p99_us": 4216.632805764675,
+        "proxy_cpu_seconds": 0.42,
+        "upstream_connections": 2964
+      },
+      {
+        "requests_per_second": 9916.633857395347,
+        "mean_us": 1600.7849781308323,
+        "p99_us": 3959.554713219404,
+        "proxy_cpu_seconds": 0.43,
+        "upstream_connections": 2900
+      },
+      {
+        "requests_per_second": 8489.04282314497,
+        "mean_us": 1870.7167744869366,
+        "p99_us": 5128.513090312481,
+        "proxy_cpu_seconds": 0.47,
+        "upstream_connections": 2659
+      },
+      {
+        "requests_per_second": 9678.890996259037,
+        "mean_us": 1633.359363535419,
+        "p99_us": 4183.794371783733,
+        "proxy_cpu_seconds": 0.41,
+        "upstream_connections": 2808
+      },
+      {
+        "requests_per_second": 9626.660618955922,
+        "mean_us": 1640.740949951578,
+        "p99_us": 4137.993790209293,
+        "proxy_cpu_seconds": 0.46,
+        "upstream_connections": 2518
+      }
+    ]
+  }
+}
