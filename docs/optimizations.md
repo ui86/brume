@@ -84,3 +84,14 @@ cargo test --locked --release --features performance-bench --lib benchmark_dns_c
 基准在同一个优化构建中交替运行旧的无条件换代行为与新的内容比较路径，使用本机 DNS 上游、60 秒 TTL，预热后连续执行 1000 次相同配置刷新和 A 记录查询。为避免每轮等待 60 秒，直接调用实际的快照替换逻辑；不包含系统文件读取，也不代表正常缓存命中的平均网络延迟。
 
 五轮每次刷新及查询的耗时中位数：55.14 μs → 2.33 μs。测量阶段每轮 DNS 上游查询由 1000 次降至 0 次，全部查询结果一致。15 项客户端 DNS 测试通过，覆盖缓存保留、配置变化换代、错误、hosts、超时取消和连接配额。原始数据见[DNS 刷新基准](benchmarks/dns-refresh.json)。
+
+## 6. HTTP 分散写透传：回退
+
+试验为 `ClientIo` 增加 `is_write_vectored` 和 `poll_write_vectored`，并验证多缓冲内容和活动时间更新。五项 HTTP 回归通过，但基准没有确认稳定收益，因此已回退实现及对应实现测试，仅保留实验记录。
+
+```bash
+python3 tests/performance.py /绝对路径/优化前 /绝对路径/试验版 --size 1048576 --requests 300
+python3 tests/performance.py /绝对路径/优化前 /绝对路径/试验版 --concurrency 16 --requests 500
+```
+
+五轮中位数：1 MiB 响应吞吐 707.66 → 716.39 次/秒（约 +1.2%），CPU 0.21 → 0.20 秒，差值仅一个计时刻度，且逐轮吞吐波动大于该变化。16 路 1 KiB 响应吞吐 9624 → 9529 次/秒（约 -1.0%），p99 为 4.10 → 4.24 ms。现有数据不足以证明净收益，不保留额外代码。原始数据见[大响应](benchmarks/vectored-bulk.json)和[小响应](benchmarks/vectored-small.json)。
