@@ -1,6 +1,6 @@
 [package]
 name = "brume"
-version = "1.0.9"
+version = "1.0.10"
 edition = "2024"
 description = "轻量级 SOCKS5 和 HTTP 代理服务器"
 
