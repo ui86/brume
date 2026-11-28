@@ -773,6 +773,9 @@ async fn udp_loop(
         let Some(association) = association else {
             continue;
         };
+        if try_forward_udp(&association, &target, payload) {
+            continue;
+        }
         let Ok(permit) = Arc::clone(&packet_slots).try_acquire_owned() else {
             continue;
         };
@@ -805,6 +808,34 @@ async fn udp_loop(
     flows.tasks.close();
     flows.tasks.wait().await;
     result
+}
+
+fn try_forward_udp(association: &Association, target: &Target, payload: &[u8]) -> bool {
+    let slot = association.flows.lock().unwrap().get(target).cloned();
+    let Some(slot) = slot else { return false };
+    let Some(Some(flow)) = slot.flow.get() else {
+        return false;
+    };
+    if !flow.active.load(Ordering::Relaxed) || !association.alive.load(Ordering::Relaxed) {
+        return false;
+    }
+    // 已有流可立即发送时直接借用接收缓冲，避免逐包复制负载和创建任务。
+    match flow.socket.try_send(payload) {
+        Ok(_) => {
+            *flow.last_activity.lock().unwrap() = Instant::now();
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
+        Err(_) => {
+            // 保留原有地址回退和代次校验，交由异步路径重新建立目标流。
+            if flow.active.swap(false, Ordering::Relaxed) {
+                advance_udp_address(association, target, flow, &slot);
+            }
+            flow.stopped.cancel();
+            remove_flow_slot(association, target, &slot);
+            false
+        }
+    }
 }
 
 async fn handle_udp_packet(
@@ -1696,6 +1727,32 @@ mod tests {
         });
         let relay = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         (association, flow, relay, target, destination)
+    }
+
+    #[tokio::test]
+    async fn udp_direct_send_preserves_payload_and_rejects_stopped_flows() {
+        let (association, flow, _, target, _) = test_udp_flow().await;
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        flow.socket
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        flow.socket.writable().await.unwrap();
+        for payload in [b"direct".as_slice(), b""] {
+            assert!(try_forward_udp(&association, &target, payload));
+            let mut buffer = [0; 32];
+            let (length, _) =
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&buffer[..length], payload);
+        }
+        flow.active.store(false, Ordering::Relaxed);
+        assert!(!try_forward_udp(&association, &target, b"stopped"));
+        flow.active.store(true, Ordering::Relaxed);
+        association.alive.store(false, Ordering::Relaxed);
+        assert!(!try_forward_udp(&association, &target, b"closed"));
     }
 
     #[tokio::test]

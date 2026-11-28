@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import statistics
+import struct
 import time
 
 
@@ -112,13 +113,82 @@ async def http_sample(binary, args):
     return result
 
 
+async def socks(port, command, target_port):
+    reader, writer = await asyncio.open_connection('127.0.0.1', port)
+    writer.write(b'\x05\x01\x00')
+    await writer.drain()
+    assert await reader.readexactly(2) == b'\x05\x00'
+    writer.write(bytes([5, command, 0, 1, 127, 0, 0, 1]) + struct.pack('!H', target_port))
+    await writer.drain()
+    reply = await reader.readexactly(4)
+    assert reply[:3] == b'\x05\x00\x00', reply
+    assert reply[3] in (1, 4), reply
+    await reader.readexactly((4 if reply[3] == 1 else 16) + 2)
+    return reader, writer
+
+async def udp_sample(binary, args):
+    class Echo(asyncio.DatagramProtocol):
+        def connection_made(self, transport):
+            self.transport = transport
+        def datagram_received(self, data, addr):
+            self.transport.sendto(data, addr)
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(Echo, local_addr=('127.0.0.1', 0))
+    target_port = transport.get_extra_info('sockname')[1]
+    try:
+        async with proxy(binary, args.timeout) as (port, process):
+            sockets = []
+            controls = []
+            try:
+                for _ in range(args.concurrency):
+                    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    udp.setblocking(False)
+                    udp.bind(('127.0.0.1', 0))
+                    udp.connect(('127.0.0.1', port))
+                    sockets.append(udp)
+                    controls.append(await socks(port, 3, udp.getsockname()[1]))
+                header = bytes([0, 0, 0, 1, 127, 0, 0, 1]) + struct.pack('!H', target_port)
+                packet = header + b'X' * args.size
+                async def lane(udp, count):
+                    samples = []
+                    for _ in range(count):
+                        started = time.perf_counter()
+                        for _ in range(args.batch):
+                            await loop.sock_sendall(udp, packet)
+                        for _ in range(args.batch):
+                            reply = await asyncio.wait_for(loop.sock_recv(udp, 65535), 2)
+                            assert reply == packet
+                        samples.append((time.perf_counter() - started) * 1e6 / args.batch)
+                    return samples
+                await asyncio.gather(*(lane(udp, 10) for udp in sockets))
+                before_cpu = process_cpu(process.pid)
+                start = time.perf_counter()
+                lanes = await asyncio.gather(*(lane(udp, args.requests) for udp in sockets))
+                elapsed = time.perf_counter() - start
+                samples = sorted(sample for values in lanes for sample in values)
+                return {
+                    'packets_per_second': len(samples) * args.batch / elapsed,
+                    'mean_us_per_packet': statistics.mean(samples),
+                    'proxy_cpu_seconds': process_cpu(process.pid) - before_cpu,
+                }
+            finally:
+                for udp in sockets:
+                    udp.close()
+                for _, writer in controls:
+                    writer.close()
+                await asyncio.gather(*(writer.wait_closed() for _, writer in controls))
+    finally:
+        transport.close()
+
+
 async def main(args):
     results = {binary: [] for binary in args.binaries}
     for round_index in range(args.rounds):
         # 交替执行次序，降低机器状态随时间变化带来的偏差。
         order = args.binaries if round_index % 2 == 0 else list(reversed(args.binaries))
         for binary in order:
-            sample = await asyncio.wait_for(http_sample(binary, args), 60)
+            action = http_sample if args.mode == "http" else udp_sample
+            sample = await asyncio.wait_for(action(binary, args), 60)
             results[binary].append(sample)
     medians = {
         binary: {key: statistics.median(sample[key] for sample in samples) for key in samples[0]}
@@ -130,6 +200,8 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binaries", nargs="+", help="待比较的代理程序绝对路径")
+    parser.add_argument("--mode", choices=["http", "udp"], default="http")
+    parser.add_argument("--batch", type=int, default=1, help="每批 UDP 包数")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--requests", type=int, default=1000, help="每条连接的请求次数")
     parser.add_argument("--concurrency", type=int, default=1)
